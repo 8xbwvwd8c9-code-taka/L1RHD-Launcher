@@ -15,6 +15,13 @@
 - src/ui/：egui 介面與元件。
 - src/inject.rs、src/remotehook.rs、src/sockhook.rs、src/patches.rs：歷史相容與 direct-launch 程式碼；direct-launch 預設關閉，變更前須確認目標版本、啟用條件及程序副作用。
 
+## 已核實的客戶端版本
+
+- 目前唯一記錄完整指紋的目標是 Lineage Remastered x64 2020-02-12 build。
+- bin64/Lin.bin 與 bin64/LogonX64.bin 的 SHA-256 為 3490FF3F11D2E92DF4A99F72991054F6A2757AF737664FA1E05ED3F41A172AF0；PE timestamp 為 0x5E43D8D0。
+- 經 Login.exe 啟動時，執行期日誌回報 2002122605；直接啟動 BIN 時回報 2002122601。這兩個數值是啟動路徑標記，不可當成檔案指紋。
+- README 的版本表與 src/patches.rs 的 LIN_TIMESTAMP、VERSION_RAW 必須保持一致。其他 BIN/x86 版本未驗證，不可宣稱支援。
+
 ## 開發規則
 
 - 保持 Windows 支援與既有 Cargo 依賴；新增依賴前先確認標準函式庫或現有 crate 能否處理。
