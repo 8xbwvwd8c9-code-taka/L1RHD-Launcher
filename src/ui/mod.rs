@@ -65,7 +65,7 @@ impl LauncherApp {
         theme::install_fonts(&cc.egui_ctx);
         theme::install_style(&cc.egui_ctx);
         crate::logging::set_repaint_ctx(cc.egui_ctx.clone());
-        widgets::install_bg(&cc.egui_ctx);
+
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
