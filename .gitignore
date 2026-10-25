@@ -1,0 +1,11 @@
+/target/
+/launcher.json
+/servers.ini
+*.log
+*.exe
+*.pdb
+*.bak
+*.codex-backup*
+/tools/
+/docs/
+/.mimosa/
