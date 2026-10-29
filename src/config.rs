@@ -24,11 +24,10 @@ pub struct AppConfig {
     /// 上次選到的伺服器名稱（servers.ini 的段名）
     #[serde(default)]
     pub last_server: String,
-    /// B1 直啟模式（實驗）：true = 不掛原版 Login.exe，直接啟動 bin64\Lin.bin
-    /// 並於解殼完成後寫入六刀補丁（見 patches.rs / 黑曜石 20261025 筆記 §10.5–10.6）。
-    /// 預設 false = 路線 A（託管原版 Login.exe，已實測 PASS）。
-    #[serde(default)]
-    pub direct_launch: bool,
+    /// 進程內補丁路線（rhd_inproc.dll；TR-BUG-458 路線 B2）。
+    /// false = 維持「安全驗證未完成」的停用狀態，不啟動遊戲。
+    #[serde(default = "def_true")]
+    pub inproc_launch: bool,
 }
 
 fn def_true() -> bool {
@@ -44,8 +43,21 @@ impl Default for AppConfig {
             block_official_list: true,
             minimize_to_tray: true,
             last_server: String::new(),
-            direct_launch: false,
+            inproc_launch: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inproc_launch_defaults_to_enabled() {
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.inproc_launch);
+        let off: AppConfig = serde_json::from_str(r#"{"inproc_launch": false}"#).unwrap();
+        assert!(!off.inproc_launch);
     }
 }
 

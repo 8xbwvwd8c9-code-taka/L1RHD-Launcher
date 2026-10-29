@@ -1,4 +1,4 @@
-//! RHDLauncher — 自製登入器
+//! RHD 大叔的回憶天堂 —— 自製登入器
 //!
 //! 入口：提權檢查 → 讀設定 → 建 runtime → 開視窗
 
@@ -10,14 +10,10 @@ mod cfgfile;
 mod config;
 mod elevate;
 mod hosts;
-mod inject;
+mod inproc;
 mod launch;
-mod loginhost;
 mod logging;
-mod patches;
 mod relay;
-mod remotehook;
-mod sockhook;
 mod servers;
 mod ui;
 mod updater;
@@ -37,18 +33,10 @@ fn main() {
         return;
     }
 
-    // LoginHost 模式：本程式被複製改名為 Login.exe 後，只負責「以 Login.exe 身分」啟動客戶端
-    // 目的：客戶端會檢查父進程，歷史上成功時父進程就是 Login.exe（見 lin.log parentFile 14540）
+    // 舊啟動入口已停用，避免既有腳本誤啟動客戶端。
     if std::env::args().any(|a| a == "--login-host") {
-        login_host_mode();
-        return;
-    }
-
-    // 管理員不再是必要條件（asInvoker，雙擊即開不再彈 UAC）：
-    // - B1 直啟模式：hosts 封鎖可略過、補丁寫入與客戶端同權限等級即可
-    // - 路線 A：缺管理員只影響 hosts 封鎖（降級為警告，功能仍可用）
-    if !elevate::is_admin() {
-        // 不退出；讓 UI 起來後於日誌顯示降級說明
+        eprintln!("舊登入入口已停用，遊戲啟動等待安全驗證。");
+        std::process::exit(1);
     }
 
     let log = LogHandle::new();
@@ -59,11 +47,7 @@ fn main() {
     log.set_dir(exe_dir.clone());
     log.info("═══ RHD Launcher 啟動 ═══");
     log.info(format!("工作目錄 = {}", exe_dir.display()));
-    if elevate::is_admin() {
-        log.info("權限 = 管理員（hosts 封鎖可用）");
-    } else {
-        log.info("權限 = 一般使用者（hosts 封鎖將略過；B1 直啟不受影響）");
-    }
+    log.info(format!("管理員權限 = {}", elevate::is_admin()));
 
     let cfg = config::load();
 
@@ -71,12 +55,12 @@ fn main() {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([760.0, 560.0])
             .with_min_inner_size([680.0, 480.0])
-            .with_title("RHDLauncher"),
+            .with_title("Takanashi製作"),
         ..Default::default()
     };
 
     if let Err(e) = eframe::run_native(
-        "RHDLauncher",
+        "Takanashi製作",
         opts,
         Box::new(move |cc| Ok(Box::new(ui::LauncherApp::new(cc, cfg, log)))),
     ) {
@@ -157,53 +141,6 @@ fn relay_daemon_mode() {
             }
         }
         Err(e) => log.error(format!("常駐中繼啟動失敗：{e}")),
-    }
-}
-
-/// LoginHost 模式：扮演原版 Login.exe 的父進程角色
-/// 用法：把 RHDLauncher.exe 複製成 Login.exe，再由真正的 launcher 以 --login-host 喚起
-fn login_host_mode() {
-    let log = LogHandle::new();
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|x| x.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    log.set_dir(exe_dir.clone());
-    log.info("── LoginHost 模式啟動 ──");
-
-    let cfg = config::load();
-    let profiles = match servers::load() {
-        Ok(v) => v,
-        Err(e) => {
-            log.error(format!("servers.ini: {e}"));
-            return;
-        }
-    };
-    let p = match profiles.first() {
-        Some(p) => p.clone(),
-        None => {
-            log.error("沒有伺服器設定");
-            return;
-        }
-    };
-
-    // 啟動客戶端 + 注入 LinLogin.dll + 呼叫匯出函式
-    // 關鍵：版本號 2002122605 vs 2002122601 證明是 LinLogin.dll 覆寫的
-    match inject::launch_and_inject_ex(&p.game_dir, log.clone(), None) {
-        Ok(pid) => log.info(format!("客戶端已啟動 pid {pid}")),
-        Err(e) => {
-            log.error(format!("啟動失敗：{e}"));
-            return;
-        }
-    }
-
-    // 保持存活，讓客戶端認得父進程
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        if launch::client_process_running().is_none() {
-            log.info("客戶端已結束，LoginHost 退出");
-            break;
-        }
     }
 }
 
@@ -304,17 +241,5 @@ fn selftest() {
         }
         Err(e) => log.error(format!("relay start failed: {e}")),
     }
-    // §10.18 connect hook 位址驗證（僅在客戶端已載入時有效）
-    match sockhook::module_base_for_self() {
-        Ok(base) => {
-            log.info(format!("client image base = 0x{base:X}"));
-            match sockhook::verify_connect_site(base) {
-                Ok(addr) => log.info(format!("connect hook site 驗證通過 @ 0x{addr:X}")),
-                Err(e) => log.error(format!("connect hook site 驗證失敗：{e}")),
-            }
-        }
-        Err(e) => log.warn(format!("客戶端未載入，略過 hook 驗證：{e}")),
-    }
-
     log.info("=== SELFTEST END ===");
 }

@@ -16,7 +16,7 @@ fn main() {
 </assembly>"#,
         );
         res.set("ProductName", "RHD Launcher");
-        res.set("FileDescription", "RHDLauncher");
+        res.set("FileDescription", "RHD Launcher");
         res.set("LegalCopyright", "for personal private-server use");
         if let Err(e) = res.compile() {
             println!("cargo:warning=winresource failed: {e}");

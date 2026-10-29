@@ -1,0 +1,5 @@
+if(NOT EXISTS "${FIXTURE}" OR NOT DEFINED OUTPUT)
+    message(FATAL_ERROR "Fixture or output path missing.")
+endif()
+file(SHA256 "${FIXTURE}" fixture_sha256)
+file(WRITE "${OUTPUT}" "#pragma once\n#define RHD_FIXTURE_SHA256 L\"${fixture_sha256}\"\n")

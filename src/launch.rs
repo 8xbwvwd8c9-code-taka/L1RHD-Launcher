@@ -1,19 +1,9 @@
-//! 啟動 Login.exe 與進程監控 (企畫書 §5.7)
+//! 伺服器連線狀態與遊戲程序檢查。
 //!
-//! launcher 自己已是管理者，Command::new 直接可用（不會出現 WinError 740）。
-//! current_dir 必須設正確：lin.log / lineage.cfg / <角色名>.loc 都寫在遊戲根目錄。
-//! Login.exe 退出不等於失敗（它本來就會在 game Initialize Complete! 後自己退出）。
+//! 程序清單檢查失敗必須回傳錯誤，不得視為沒有正在運行的遊戲。
 
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::Path;
-use std::process::{Child, Command};
 use std::time::Duration;
-
-#[allow(dead_code)]
-pub struct Launched {
-    pub child: Child,
-    pub pid: u32,
-}
 
 pub fn target_alive(host: &str, port: u16, timeout: Duration) -> bool {
     let addr = format!("{host}:{port}");
@@ -27,21 +17,6 @@ pub fn target_alive(host: &str, port: u16, timeout: Duration) -> bool {
     TcpStream::connect_timeout(&sock, timeout).is_ok()
 }
 
-#[allow(dead_code)]
-pub fn launch_login(game_dir: &str, exe_name: &str) -> Result<Launched, String> {
-    let dir = Path::new(game_dir);
-    let exe = dir.join(exe_name);
-    if !exe.exists() {
-        return Err(format!("找不到 {} —— 請確認遊戲路徑", exe.display()));
-    }
-    let child = Command::new(&exe)
-        .current_dir(dir)
-        .spawn()
-        .map_err(|e| format!("啟動 {} 失敗：{e}", exe.display()))?;
-    let pid = child.id();
-    Ok(Launched { child, pid })
-}
-
 /// 轉換成人類可讀的結束描述
 #[allow(dead_code)]
 pub fn describe_exit(code: Option<i32>) -> String {
@@ -52,21 +27,25 @@ pub fn describe_exit(code: Option<i32>) -> String {
 }
 
 /// 檢查客戶端進程是否存在（LogonX64.bin / Lin.bin）
-pub fn client_process_running() -> Option<String> {
-    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+pub fn client_process_running() -> Result<Option<String>, String> {
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
+    };
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
     };
 
     unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            .map_err(|e| format!("建立程序快照失敗：{e}"))?;
         if snap == INVALID_HANDLE_VALUE {
-            return None;
+            return Err("建立程序快照失敗：無效控制代碼".into());
         }
         let mut pe = PROCESSENTRY32W::default();
         pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut found = None;
-        if Process32FirstW(snap, &mut pe).is_ok() {
+        let result = (|| {
+            Process32FirstW(snap, &mut pe)
+                .map_err(|e| format!("讀取程序快照失敗：{e}"))?;
             loop {
                 let name = String::from_utf16_lossy(
                     &pe.szExeFile[..pe
@@ -77,15 +56,84 @@ pub fn client_process_running() -> Option<String> {
                 );
                 let low = name.to_ascii_lowercase();
                 if low.contains("logonx64") || low == "lin.bin" || low.starts_with("lin_") {
-                    found = Some(format!("{name}(pid {})", pe.th32ProcessID));
-                    break;
+                    return Ok(Some(format!("{name}(pid {})", pe.th32ProcessID)));
                 }
-                if Process32NextW(snap, &mut pe).is_err() {
-                    break;
+                if let Err(e) = Process32NextW(snap, &mut pe) {
+                    return if e.code() == windows::core::HRESULT::from_win32(ERROR_NO_MORE_FILES.0) {
+                        Ok(None)
+                    } else {
+                        Err(format!("列舉程序快照失敗：{e}"))
+                    };
                 }
             }
-        }
+        })();
         let _ = CloseHandle(snap);
-        found
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::process::{Child, Command, Stdio};
+
+    #[test]
+    fn fake_client_waiter() {
+        if std::env::var_os("RHD_FAKE_CLIENT_TEST").is_some() {
+            let mut byte = [0];
+            let _ = std::io::stdin().read(&mut byte);
+        }
+    }
+
+    #[test]
+    fn recognizes_existing_client_without_terminating_it() {
+        if client_process_running().unwrap().is_some() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rhd-client-fixture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let exe = dir.join("Lin.bin");
+        struct Fixture(Option<Child>, std::path::PathBuf, std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.as_mut() {
+                    drop(child.stdin.take());
+                    let _ = child.wait();
+                }
+                let _ = std::fs::remove_file(&self.1);
+                let _ = std::fs::remove_dir(&self.2);
+            }
+        }
+        let mut fixture = Fixture(None, exe, dir);
+        std::fs::copy(std::env::current_exe().unwrap(), &fixture.1).unwrap();
+        let child = Command::new(&fixture.1)
+            .args(["--exact", "launch::tests::fake_client_waiter", "--nocapture"])
+            .env("RHD_FAKE_CLIENT_TEST", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        fixture.0 = Some(child);
+        let child = fixture.0.as_mut().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let found = client_process_running().unwrap();
+            if found.as_deref().is_some_and(|s| s.contains(&format!("pid {}", child.id()))) {
+                assert!(child.try_wait().unwrap().is_none());
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "fixture process not detected");
+            assert!(child.try_wait().unwrap().is_none(), "fixture exited unexpectedly");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }

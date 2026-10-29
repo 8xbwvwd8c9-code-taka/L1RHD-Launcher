@@ -15,14 +15,18 @@
 //! ⚠ 本模組目前僅提供位址解析與 patch 前置檢查；實際套用需在客戶端
 //!   行程內（遠端）執行，屬進階操作，預設不自動啟用。
 
+compile_error!("TR-BUG-458：禁止重新編入舊 socket hook 流程。");
+
 use std::ffi::c_void;
 
 /// ImageBase + 0xA7A8C4：SocketMain 的 connect 呼叫點
 pub const RVA_CONNECT_SOCKETMAIN: usize = 0xA7A8C4;
-/// 預期的前 12 bytes（用於驗證客戶端版本未被替換）
-pub const EXPECT_CONNECT_PREFIX: [u8; 10] = [
+/// 預期的前 11 bytes（用於驗證客戶端版本未被替換）
+/// [已修復但未實機測試][TR-BUG-337] 覆蓋長度必須落在完整指令邊界：
+/// lea rdx,[rsp+0x20] 為 5 bytes，mov r8d,0x10 為 6 bytes，合計 11 bytes。
+pub const EXPECT_CONNECT_PREFIX: [u8; 11] = [
     0x48, 0x8D, 0x54, 0x24, 0x20, // lea rdx, [rsp+0x20]
-    0x41, 0xB8, 0x10, 0x00, 0x00, // mov r8d, 0x10（前 3 bytes）
+    0x41, 0xB8, 0x10, 0x00, 0x00, 0x00, // mov r8d, 0x10
 ];
 
 /// 驗證目標記憶體是否為預期指令（防換版誤 patch）
@@ -30,8 +34,8 @@ pub fn verify_connect_site(image_base: usize) -> Result<usize, String> {
     let addr = image_base + RVA_CONNECT_SOCKETMAIN;
     unsafe {
         let p = addr as *const u8;
-        let mut got = [0u8; 10];
-        std::ptr::copy_nonoverlapping(p, got.as_mut_ptr(), 10);
+        let mut got = [0u8; EXPECT_CONNECT_PREFIX.len()];
+        std::ptr::copy_nonoverlapping(p, got.as_mut_ptr(), got.len());
         if got != EXPECT_CONNECT_PREFIX {
             return Err(format!(
                 "connect 位址 0x{addr:X} 指令不符預期：{:02X?}（可能是客戶端換版）",
@@ -136,8 +140,7 @@ pub fn module_base_for_self() -> Result<usize, String> {
     Err("本行程未載入客戶端模組".into())
 }
 /// 以 EnumProcessModulesEx 取得主模組基底（對 CREATE_SUSPENDED 行程較可靠）
-pub fn main_module_base_psapi(hproc: windows::Win32::Foundation::HANDLE) -> Result<usize, String> {
-    use windows::Win32::System::ProcessStatus::{EnumProcessModulesEx, LIST_MODULES_ALL};
+pub fn main_module_base_psapi(hproc: windows::Win32::Foundation::HANDLE) -> Result<usize, String> {    use windows::Win32::System::ProcessStatus::{EnumProcessModulesEx, LIST_MODULES_ALL};
     use windows::Win32::Foundation::HMODULE;
 
     let mut mods: [HMODULE; 1024] = [HMODULE::default(); 1024];
@@ -163,4 +166,36 @@ pub fn main_module_base_psapi(hproc: windows::Win32::Foundation::HANDLE) -> Resu
         return Err("主模組基底為 0".into());
     }
     Ok(base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TR-BUG-337：覆蓋長度必須是完整指令邊界，否則會把下一條指令切成半條。
+    #[test]
+    fn connect_prefix_covers_two_complete_instructions() {
+        assert_eq!(
+            EXPECT_CONNECT_PREFIX.len(),
+            11,
+            "lea(5) + mov r8d,imm32(6) = 11 bytes 才對齊指令邊界"
+        );
+        assert_eq!(
+            &EXPECT_CONNECT_PREFIX[0..5],
+            &[0x48, 0x8D, 0x54, 0x24, 0x20]
+        );
+        assert_eq!(
+            &EXPECT_CONNECT_PREFIX[5..11],
+            &[0x41, 0xB8, 0x10, 0x00, 0x00, 0x00],
+            "mov r8d,0x10 必須完整覆蓋 6 bytes，imm32 不可被 jmp 切斷"
+        );
+    }
+
+    #[test]
+    fn sockaddr_in_layout_is_network_order() {
+        let sa = sockaddr_in([192, 168, 1, 10], 2000);
+        assert_eq!(&sa[0..2], &[2, 0], "sin_family = AF_INET");
+        assert_eq!(&sa[2..4], &[0x07, 0xD0], "sin_port 需為 big-endian 2000");
+        assert_eq!(&sa[4..8], &[192, 168, 1, 10], "sin_addr 依序填 IP");
+    }
 }

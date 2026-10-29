@@ -270,6 +270,35 @@ async fn accept_loop(
 }
 
 /// 雙向 pump：位元組原封不動；任一方向結束就 shutdown 對方，等另一方向也收尾。
+/// TR-BUG-458 [已修復但未實機測試]：日誌只記方向與長度，避免記錄登入憑證。
+async fn pipe_with_log<R, W>(
+    mut r: R,
+    mut w: W,
+    tag: &'static str,
+    seq: u64,
+    log: LogHandle,
+) -> std::io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 16384];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        log.info(format!("[#{seq}] {tag} {n} bytes"));
+        w.write_all(&buf[..n]).await?;
+        w.flush().await?;
+    }
+    let _ = w.shutdown().await;
+    Ok(total)
+}
+
 async fn pump(
     mut inbound: TcpStream,
     mut outbound: TcpStream,
@@ -279,21 +308,13 @@ async fn pump(
 ) {
     let _ = inbound.set_nodelay(true);
     let _ = outbound.set_nodelay(true);
-    let (mut ir, mut iw) = inbound.split();
-    let (mut or_, mut ow) = outbound.split();
+    let (ir, iw) = inbound.split();
+    let (or_, ow) = outbound.split();
 
     // 兩個方向獨立進行，任一方向 EOF 只關閉該方向，不強制中斷另一方向
     // （比照 relay_debug.py 的 settimeout(None) 行為，避免遊戲長連線被切斷）
-    let up = async {
-        let n = tokio::io::copy(&mut ir, &mut ow).await;
-        let _ = ow.shutdown().await;
-        n
-    };
-    let down = async {
-        let n = tokio::io::copy(&mut or_, &mut iw).await;
-        let _ = iw.shutdown().await;
-        n
-    };
+    let up = pipe_with_log(ir, ow, "C>S", seq, log.clone());
+    let down = pipe_with_log(or_, iw, "S>C", seq, log.clone());
 
     tokio::select! {
         _ = stop_rx.changed() => {
@@ -308,5 +329,39 @@ async fn pump(
                 (Err(e), _) | (_, Err(e)) => log.warn(format!("[#{seq}] 中斷：{e}")),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn forwards_payload_without_recording_its_contents() {
+        let (mut producer, input) = tokio::io::duplex(128);
+        let (output, mut consumer) = tokio::io::duplex(128);
+        let log = LogHandle::new();
+        let payload = b"SENSITIVE_TEST_VALUE";
+        let send = async {
+            producer.write_all(payload).await.unwrap();
+            producer.shutdown().await.unwrap();
+        };
+        let receive = async {
+            let mut received = Vec::new();
+            consumer.read_to_end(&mut received).await.unwrap();
+            received
+        };
+        let ((), result, received) = tokio::join!(
+            send,
+            pipe_with_log(input, output, "C>S", 1, log.clone()),
+            receive
+        );
+        assert_eq!(result.unwrap(), payload.len() as u64);
+        assert_eq!(received, payload);
+        let exported = log.export();
+        assert!(exported.contains("C>S 20 bytes"));
+        assert!(!exported.contains("SENSITIVE_TEST_VALUE"));
+        assert!(!exported.contains("53 45 4E 53 49 54 49 56 45"));
     }
 }

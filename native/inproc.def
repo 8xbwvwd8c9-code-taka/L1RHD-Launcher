@@ -1,0 +1,3 @@
+LIBRARY rhd_inproc
+EXPORTS
+    RhdPatchStart @1

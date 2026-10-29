@@ -1,0 +1,2 @@
+8f173eacf8efdef83f1c53214e8c4a53bb119766950a939d92c92a55efb390d0 *rhd-launcher.exe
+e501ee0ecec8639a9046a2119cefb2887b8d7c1295866f521bcd2ab1c8ec5e8b *rhd_inproc.dll

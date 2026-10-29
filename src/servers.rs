@@ -12,7 +12,6 @@ pub struct ServerProfile {
     pub port: u16,
     pub listen_ports: Vec<u16>,
     pub game_dir: String,
-    pub login_exe: String,
 }
 
 impl ServerProfile {
@@ -36,22 +35,22 @@ pub fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// game_dir 正規化——支援三種寫法，登入器不鎖死絕對路徑：
+/// game_dir 正規化，所有路徑以登入器所在目錄為基準：
 ///   1. 空 / 未寫            → exe 所在目錄（登入器直接放遊戲根目錄即可）
 ///   2. 相對路徑（如 `..`）   → 以 exe 所在目錄為基準解析
-///   3. 絕對路徑              → 原樣沿用；**但目錄已不存在時退回 exe 目錄**
-///      （情境：遊戲搬槽後舊 ini 帶著死路徑，如 舊安裝路徑 → 新安裝路徑）
+///   3. 舊設定的絕對路徑    → 退回登入器所在目錄
 fn normalize_game_dir(raw: &str) -> String {
     let raw = raw.trim();
     if raw.is_empty() {
         return exe_dir().to_string_lossy().to_string();
     }
     let p = Path::new(raw);
-    if p.is_absolute() {
-        if p.is_dir() {
-            return raw.to_string();
-        }
-        // 絕對路徑指向不存在的目錄 → 退回登入器所在目錄
+    if p.components().any(|part| {
+        matches!(
+            part,
+            std::path::Component::Prefix(_) | std::path::Component::RootDir
+        )
+    }) {
         return exe_dir().to_string_lossy().to_string();
     }
     exe_dir()
@@ -63,17 +62,16 @@ fn normalize_game_dir(raw: &str) -> String {
 
 pub fn example_ini() -> String {
     [
-        "; RHDLauncher —— 伺服器清單（UTF-8）",
+        "; Takanashi製作 —— 伺服器清單（UTF-8）",
         "; 每段 = 一個伺服器；段名就是左側清單顯示的名稱",
         "; 改這個檔就能換 IP / Port / 名稱，登入器不用改",
-        "; game_dir 支援：留空＝登入器所在目錄｜相對路徑（以登入器位置為基準）｜絕對路徑",
+        "; game_dir：留空＝登入器所在目錄；相對路徑以登入器所在目錄為基準",
         "",
         "[黑皮天堂]",
         "host=127.0.0.1",
         "port=3000",
         "listen=2000,29467",
         "game_dir=",
-        "login_exe=Login.exe",
         "",
     ]
     .join("\r\n")
@@ -106,7 +104,6 @@ pub fn load() -> Result<Vec<ServerProfile>, String> {
                 listen_ports: vec![2000, 29467],
                 // 預設＝登入器所在目錄（normalize_game_dir 會再正規化）
                 game_dir: String::new(),
-                login_exe: "Login.exe".into(),
             });
             continue;
         }
@@ -125,7 +122,6 @@ pub fn load() -> Result<Vec<ServerProfile>, String> {
             }
             "listen" | "listen_ports" => s.listen_ports = crate::config::parse_ports(v),
             "game_dir" | "gamedir" => s.game_dir = v.to_string(),
-            "login_exe" | "loginexe" => s.login_exe = v.to_string(),
             _ => {}
         }
     }
@@ -142,4 +138,26 @@ pub fn load() -> Result<Vec<ServerProfile>, String> {
         return Err(format!("{} 裡沒有任何 [伺服器名稱] 段落", path.display()));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn game_dir_is_anchored_to_launcher_directory() {
+        let base = exe_dir();
+        assert_eq!(PathBuf::from(normalize_game_dir("")), base);
+        assert_eq!(PathBuf::from(normalize_game_dir(".")), base.canonicalize().unwrap());
+        assert_eq!(
+            PathBuf::from(normalize_game_dir(&base.to_string_lossy())),
+            base
+        );
+        let rooted = format!("{}other", std::path::MAIN_SEPARATOR);
+        assert_eq!(PathBuf::from(normalize_game_dir(&rooted)), base);
+        if let Some(std::path::Component::Prefix(prefix)) = base.components().next() {
+            let drive_relative = format!("{}other", prefix.as_os_str().to_string_lossy());
+            assert_eq!(PathBuf::from(normalize_game_dir(&drive_relative)), base);
+        }
+    }
 }

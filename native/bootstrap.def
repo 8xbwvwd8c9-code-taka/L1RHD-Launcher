@@ -1,0 +1,3 @@
+LIBRARY rhd_bootstrap
+EXPORTS
+    RhdBootstrapOrdinal @1 NONAME

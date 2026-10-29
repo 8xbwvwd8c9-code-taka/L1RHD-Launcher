@@ -1,10 +1,10 @@
 //! 主介面：全屏背景圖 + 左側伺服器列表
 //!
 //! 依使用者最終指示（2026-10-24）：
-//!   - 標題：RHDLauncher
-//!   - 不顯示個人品牌名稱
+//!   - 標題：Takanashi製作
+//!   - 不顯示「RHD 大叔的回憶天堂」
 //!   - 左側伺服器列表，讀 servers.ini 決定名稱 / IP / Port
-//!   - 沒有任何按鈕；背景自動更新 → 吃檔 → 封鎖 → 中繼 → 背景接管 Login.exe
+//!   - 啟動入口保持停用，直到自製初始化方案完成安全驗證
 //!   - 錯誤 LOG 自動匯出，不顯示
 //!   - 不跳出原版登入器，直接進遊戲
 
@@ -12,16 +12,13 @@ pub mod theme;
 pub mod widgets;
 
 use crate::config::AppConfig;
-use crate::hosts;
+use crate::inproc;
 use crate::launch;
-use crate::loginhost::HiddenLogin;
 use crate::logging::{LogHandle, LogLine};
 use crate::relay::{self, RelayHandle};
 use crate::servers::{self, ServerProfile};
-use crate::updater::UpdaterConfig;
 use eframe::egui;
 use std::collections::VecDeque;
-use std::os::windows::process::CommandExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,10 +26,15 @@ use std::time::{Duration, Instant};
 enum Phase {
     Idle,
     Booting,
-    Updating,
-    Launching,
-    Running,
     Failed,
+}
+
+fn launch_hold_status(process: Result<Option<String>, String>) -> String {
+    match process {
+        Ok(Some(name)) => format!("偵測到既有遊戲 {name}，請先自行關閉"),
+        Err(e) => format!("無法檢查遊戲程序：{e}"),
+        Ok(None) => "遊戲啟動暫停：安全驗證尚未完成".into(),
+    }
 }
 
 pub struct LauncherApp {
@@ -41,14 +43,11 @@ pub struct LauncherApp {
     lines: VecDeque<LogLine>,
     rt: Arc<tokio::runtime::Runtime>,
     relay: Option<RelayHandle>,
-    login: Option<HiddenLogin>,
-    client_pid: Option<u32>,
 
     profiles: Vec<ServerProfile>,
     selected: usize,
     ini_error: Option<String>,
     ini_mtime: Option<std::time::SystemTime>,
-    upd: UpdaterConfig,
 
     phase: Phase,
     status: String,
@@ -56,8 +55,6 @@ pub struct LauncherApp {
     client_proc: Option<String>,
     last_probe: Instant,
     queued: bool,
-    /// 交接成功後的自動退出計時（None = 不退出）
-    exit_deadline: Option<Instant>,
 }
 
 impl LauncherApp {
@@ -65,7 +62,7 @@ impl LauncherApp {
         theme::install_fonts(&cc.egui_ctx);
         theme::install_style(&cc.egui_ctx);
         crate::logging::set_repaint_ctx(cc.egui_ctx.clone());
-
+        widgets::install_bg(&cc.egui_ctx);
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -82,11 +79,6 @@ impl LauncherApp {
             .iter()
             .position(|p| p.name == cfg.last_server)
             .unwrap_or(0);
-        let upd = UpdaterConfig {
-            updater: cfg.updater.clone(),
-            apply_patch: cfg.apply_patch.clone(),
-            auto_apply: cfg.auto_apply_after_update,
-        };
         let ini_mtime = std::fs::metadata(servers::ini_path())
             .and_then(|m| m.modified())
             .ok();
@@ -97,20 +89,16 @@ impl LauncherApp {
             lines: VecDeque::with_capacity(256),
             rt: Arc::new(rt),
             relay: None,
-            login: None,
-            client_pid: None,
             profiles,
             selected,
             ini_error,
             ini_mtime,
-            upd,
             phase: Phase::Idle,
             status: String::new(),
             target_ok: false,
             client_proc: None,
             last_probe: Instant::now() - Duration::from_secs(10),
             queued: false,
-            exit_deadline: None,
         }
     }
 
@@ -148,146 +136,70 @@ impl LauncherApp {
             let (h, port) = (p.host.clone(), p.port);
             self.target_ok = launch::target_alive(&h, port, Duration::from_millis(500));
         }
-        self.client_proc = launch::client_process_running();
+        self.client_proc = match launch::client_process_running() {
+            Ok(process) => process,
+            Err(e) => Some(format!("無法檢查遊戲程序：{e}")),
+        };
     }
 
-    /// 背景流程：封鎖 → 更新 → 吃檔 → 中繼 → 背景接管 Login.exe
+    /// 進入遊戲：進程內補丁路線（TR-BUG-458 路線 B2，rhd_inproc.dll）。
+    ///
+    /// 前置檢查失敗（既有程序、程序盤點錯誤）一律不啟動；inproc_launch=false 時
+    /// 維持停用狀態。補丁由自製 DLL 在客戶端進程內完成，啟動器只寫入注入路徑字串。
     fn boot_sequence(&mut self) {
-        let Some(p) = self.current().cloned() else {
-            self.phase = Phase::Failed;
-            self.status = "servers.ini 沒有可用伺服器".into();
-            return;
-        };
-        self.phase = Phase::Launching;
-        self.status = "啟動中".into();
-        self.cfg.last_server = p.name.clone();
-        let _ = crate::config::save(&self.cfg);
-
-        // 1. 內建封鎖官方清單（無管理員時會失敗——僅路線 A 需要，B1 降級為警告）
-        if self.cfg.block_official_list && !hosts::is_blocked() {
-            let domains: Vec<String> =
-                hosts::BUILTIN_BLOCKED.iter().map(|s| s.to_string()).collect();
-            if let Err(e) = hosts::block(&domains) {
-                self.log.warn(format!(
-                    "hosts 封鎖失敗（{e}）——非管理員執行時屬預期；B1 直啟模式不需要此封鎖，路線 A 建議右鍵以管理員執行"
-                ));
-            }
-        }
-
-        // 2. 自動更新 + 吃檔（強制，無按鈕）
-        if self.upd.configured() {
-            self.phase = Phase::Updating;
-            self.status = "更新中".into();
-            let ok = crate::updater::run_script(&self.upd.updater, &p.game_dir, &self.log, "更新");
-            if ok && self.upd.auto_apply {
-                let patch = if self.upd.apply_patch.trim().is_empty() {
-                    self.upd.updater.clone()
-                } else {
-                    self.upd.apply_patch.clone()
-                };
-                crate::updater::run_script(&patch, &p.game_dir, &self.log, "吃檔");
-            }
-        }
-
-        // 3. 中繼：改由獨立 daemon 提供（UI 退出後仍存活）
-        self.spawn_relay_daemon();
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-        if true {
-            // 4. 啟動原版 Login.exe（已實測唯一能過 GameGuard 並完成交接的路徑）
-            //    依據：WORKING_SETUP.md 第一節必要條件 #4
-            //    防重複：若客戶端已在執行，先終止舊的再啟動，避免兩份 Login.exe 搶連線
-        if let Some(name) = crate::launch::client_process_running() {
-            self.log.warn(format!("偵測到既有客戶端 {name}，先行終止以免衝突"));
-            // 安全性：不用 /T 樹殺——SecureEngine 保護的行程被強制樹狀終止
-            // 有內核層風險（2026-10-25 當機排查，見筆記 §14）；僅終止主行程
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/IM", "LogonX64.bin"])
-                .creation_flags(0x0800_0000)
-                .status();
-            std::thread::sleep(std::time::Duration::from_millis(2500));
-        }
-            // B1 直啟分流（direct_launch=true，實驗）：零黑盒 = 直接 Lin.bin + 解殼後六刀補丁
-            // 詳見 patches.rs 與黑曜石《20261025-天R登入器執行期採證與LinLogin六刀補丁破解》§10.5
-            if self.cfg.direct_launch {
-                match crate::inject::launch_b1(&p.game_dir, self.log.clone()) {
-                    Ok(pid) => {
-                        self.log.info(format!("客戶端已啟動 pid {pid}（B1 直啟+六刀補丁）"));
-                        self.client_pid = Some(pid);
-                        self.phase = Phase::Running;
-                        self.status = "已進入遊戲（B1）".into();
-                        // B1 不自我退出：補丁執行緒在本進程內，退出會殺掉它
-                        // （實測 2026-10-25：自我退出曾把補丁執行緒帶走 → 六刀未寫 → 380）
-                    }
-                    Err(e) => {
-                        self.log.error(format!("B1 啟動失敗：{e}"));
-                        self.phase = Phase::Failed;
-                        self.status = "啟動失敗".into();
-                    }
-                }
+        match launch::client_process_running() {
+            Ok(Some(name)) => {
+                self.phase = Phase::Failed;
+                self.status = format!("偵測到既有遊戲 {name}，請先自行關閉");
+                self.log.info(self.status.clone());
                 return;
             }
-            let login_exe = std::path::Path::new(&p.game_dir).join(&p.login_exe);
-            let child = std::process::Command::new(&login_exe)
-                .current_dir(&p.game_dir)
-                .creation_flags(0x0000_0000)
-                .spawn();
-            match child.map(|c| c.id()).map_err(|e| e.to_string()) {
-                Ok(pid) => {
-                    self.log.info(format!("客戶端已啟動 pid {pid}（含 connect hook）"));
-                    self.client_pid = Some(pid);
-                    self.phase = Phase::Running;
-                    self.status = "已進入遊戲".into();
-                    // 交接成功後自我退出，避免登入器留在背景佔用資源
-                    // 中繼改由獨立的 relay 進程接管（spawn_relay_daemon）
-                    self.exit_deadline = Some(std::time::Instant::now());
-                }
-                Err(e) => {
-                    self.log.error(format!("啟動失敗：{e}"));
-                    self.phase = Phase::Failed;
-                    self.status = "啟動失敗".into();
-                }
+            Ok(None) => {}
+            Err(e) => {
+                self.phase = Phase::Failed;
+                self.status = format!("無法檢查遊戲程序：{e}");
+                self.log.error(self.status.clone());
+                return;
             }
-        } else {
+        }
+        if !self.cfg.inproc_launch {
             self.phase = Phase::Failed;
-            self.status = "連線失敗".into();
+            self.status = launch_hold_status(Ok(None));
+            self.log.info(self.status.clone());
+            return;
         }
-    }
-
-    /// 啟動獨立 relay 進程（--relay-daemon），UI 退出後中繼由它持續提供
-    ///
-    /// 會先檢查埠是否已被既有 daemon 佔用：
-    /// - 已佔用 → 直接沿用，不重複啟動
-    /// - 未佔用 → 啟動新 daemon
-    fn spawn_relay_daemon(&mut self) {
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(_) => return,
+        let Some(p) = self.current().cloned() else {
+            self.phase = Phase::Failed;
+            self.status = "沒有伺服器設定".into();
+            return;
         };
-
-        // 檢查監聽埠是否已被既有 daemon 佔用
-        let ports = match self.current() {
-            Some(p) => p.listen_ports.clone(),
-            None => return,
-        };
-        let mut all_busy = true;
-        for port in &ports {
-            let occupied = std::net::TcpListener::bind(("127.0.0.1", *port)).is_err();
-            if !occupied {
-                all_busy = false;
-            }
-        }
-        if all_busy {
-            self.log.info("常駐中繼已在執行，直接沿用");
+        if !self.ensure_relay_for(&p) {
+            self.phase = Phase::Failed;
+            self.status = "中繼啟動失敗，未啟動遊戲".into();
             return;
         }
 
-        match std::process::Command::new(&exe)
-            .arg("--relay-daemon")
-            .creation_flags(0x0000_0008) // DETACHED_PROCESS，UI 關閉不影響
-            .spawn()
-        {
-            Ok(c) => self.log.info(format!("常駐中繼已啟動 pid {}", c.id())),
-            Err(e) => self.log.warn(format!("常駐中繼啟動失敗：{e}")),
+        self.log.info("進入遊戲：進程內補丁路線（rhd_inproc.dll）");
+        match inproc::launch_inproc(&p, self.log.clone()) {
+            Ok(()) => {
+                self.phase = Phase::Booting;
+                self.status = "遊戲已啟動".into();
+                // 交棒：釋放 listen 埠 → 常駐中繼 daemon 接管 → 登入器數秒後退出，
+                // 客戶端長連線不受登入器關閉影響。
+                self.stop_all();
+                inproc::spawn_relay_daemon(&self.log);
+                let exit_log = self.log.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(3));
+                    exit_log.info("登入器退出（中繼由 daemon 接管）");
+                    std::process::exit(0);
+                });
+            }
+            Err(e) => {
+                self.phase = Phase::Failed;
+                self.status = e.clone();
+                self.log.error(e);
+            }
         }
     }
 
@@ -322,11 +234,6 @@ impl LauncherApp {
     }
 
     fn stop_all(&mut self) {
-        if let Some(l) = self.login.as_ref() {
-            l.stop_hiding();
-        }
-        // 不終止 Login.exe：它與客戶端是使用者的遊戲行程，登入器關閉不應影響遊戲
-        self.login = None;
         if let Some(mut h) = self.relay.take() {
             h.stop();
         }
@@ -378,6 +285,18 @@ impl LauncherApp {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::launch_hold_status;
+
+    #[test]
+    fn game_launch_remains_blocked_for_all_process_check_results() {
+        assert!(launch_hold_status(Ok(None)).contains("安全驗證"));
+        assert!(launch_hold_status(Ok(Some("Lin.bin".into()))).contains("既有遊戲"));
+        assert!(launch_hold_status(Err("快照失敗".into())).contains("無法檢查"));
+    }
+}
+
 impl eframe::App for LauncherApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         for l in self.log.drain() {
@@ -397,25 +316,6 @@ impl eframe::App for LauncherApp {
             }
         }
 
-        // 交接成功後自我退出（等 3 秒讓客戶端站穩）
-        if let Some(t0) = self.exit_deadline {
-            if t0.elapsed() > std::time::Duration::from_secs(3) {
-                self.log.info("客戶端已交接，登入器自動退出");
-                self.auto_export_errors();
-                // 不停止中繼：常駐 daemon 已接管
-                self.relay = None;
-                std::process::exit(0);
-            }
-        }
-
-        // 檢查 Login.exe 是否已交接退出
-        if let Some(l) = self.login.as_mut() {
-            if let Ok(Some(st)) = l.child.try_wait() {
-                let code = st.code().unwrap_or(-1);
-                self.log.info(format!("Login.exe 已交接退出（代碼 {code}）"));
-                self.login = None;
-            }
-        }
         if self.phase == Phase::Failed {
             self.auto_export_errors();
         }
@@ -566,10 +466,7 @@ impl eframe::App for LauncherApp {
         let status_text = match self.phase {
             Phase::Idle => "已選擇伺服器",
             Phase::Booting => "準備中",
-            Phase::Updating => "更新中",
-            Phase::Launching => "啟動中",
-            Phase::Running => "已進入遊戲",
-            Phase::Failed => "失敗，詳見 error log",
+            Phase::Failed => self.status.as_str(),
         };
         let sy = if show_btn {
             win_h - 86.0

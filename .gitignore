@@ -3,9 +3,22 @@
 /servers.ini
 *.log
 *.exe
+*.dll
 *.pdb
 *.bak
 *.codex-backup*
 /tools/
-/docs/
 /.mimosa/
+# 編譯產物僅收錄 dist/ 的正式發佈檔
+!/dist/
+/dist/*
+!dist/rhd-launcher.exe
+!dist/rhd_inproc.dll
+!dist/SHA256SUMS.txt
+/native/x64/
+/native/Release/
+/native/Debug/
+/native/third_party/
+/native/Testing/
+/native/CMakeCache.txt
+/native/CMakeFiles/
