@@ -17,17 +17,16 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
-/// 登入協定採證開關（launcher.json `packet_capture`，預設關閉）。
-/// 開啟時記錄每個「客戶端→伺服端」讀取區塊的**前 64 位元組 hex**（CS-PKT 行）。
-/// 注意：TCP 可能合包，區塊可能含多個邏輯封包；登入封包含帳密，日誌檔留在本機，
-/// 僅供協定對位診斷，診斷完應把開關關回。
+/// 封包採證開關（launcher.json `packet_capture`，預設關閉）。
+/// 開啟時記錄**雙向**每個讀取區塊的完整 hex（上限 600B；合包時一個區塊可能含
+/// 多個邏輯封包）。登入封包含帳密，日誌檔留在本機；診斷完應把開關關回。
 static AUTH_CAPTURE: AtomicU8 = AtomicU8::new(0);
 
 pub fn set_auth_capture(on: bool) {
     AUTH_CAPTURE.store(if on { 1 } else { 0 }, Ordering::SeqCst);
 }
 
-/// 條件成立時回傳前 64 位元組 hex 字串；否則 None。
+/// 條件成立時回傳區塊完整 hex（上限 600B）；否則 None。
 fn auth_capture_prefix(buf: &[u8]) -> Option<String> {
     if AUTH_CAPTURE.load(Ordering::SeqCst) != 1 {
         return None;
@@ -35,7 +34,7 @@ fn auth_capture_prefix(buf: &[u8]) -> Option<String> {
     if buf.is_empty() {
         return None;
     }
-    let n = buf.len().min(64);
+    let n = buf.len().min(600);
     let mut s = String::with_capacity(n * 3);
     for b in &buf[..n] {
         s.push_str(&format!("{:02X} ", b));
@@ -319,10 +318,8 @@ where
         }
         total += n as u64;
         log.info(format!("[#{seq}] {tag} {n} bytes"));
-        if tag == "C>S" {
-            if let Some(hex) = auth_capture_prefix(&buf[..n]) {
-                log.info(format!("[#{seq}] CS-PKT {hex}"));
-            }
+        if let Some(hex) = auth_capture_prefix(&buf[..n]) {
+            log.info(format!("[#{seq}] PKT-{tag} {hex}"));
         }
         w.write_all(&buf[..n]).await?;
         w.flush().await?;
