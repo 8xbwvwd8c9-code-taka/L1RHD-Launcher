@@ -260,8 +260,30 @@ impl LauncherApp {
                 true
             }
             Err(e) => {
-                // 常駐 daemon 設計為不退出：登入器重開時全部 listen 埠已被本機
-                // 既有中繼服務中 → 沿用它，不擋啟動（修復：重開顯示「中繼失敗」）
+                // 舊實例（含殘留 daemon、未關閉的舊視窗）可能占住 listen 埠：
+                // 先終止同名非自身實例再重試一次；仍失敗且本機有服務中的中繼就沿用。
+                let killed = inproc::terminate_stale_launcher_instances(&self.log);
+                if killed > 0 {
+                    std::thread::sleep(Duration::from_millis(600));
+                    match relay::start(
+                        "127.0.0.1",
+                        &p.listen_ports,
+                        &p.host,
+                        p.port,
+                        self.log.clone(),
+                        self.rt.handle(),
+                    ) {
+                        Ok(h) => {
+                            self.log.info(format!("中繼 -> {}（重綁成功）", p.host_port()));
+                            self.relay = Some(h);
+                            return true;
+                        }
+                        Err(e2) => {
+                            self.log.error(format!("中繼重綁仍失敗：{e2}"));
+                            return false;
+                        }
+                    }
+                }
                 if relay::existing_relay_on(&p.listen_ports) {
                     self.log
                         .info("偵測到既有常駐中繼（埠已服務中），沿用不重綁".to_string());

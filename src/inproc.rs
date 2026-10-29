@@ -247,16 +247,20 @@ pub fn launch_inproc(profile: &ServerProfile, log: LogHandle) -> Result<(), Stri
         return Err("ResumeThread 失敗".into());
     }
 
-    // 6. 建立結果事件（DLL 以 pid 衍生名稱開啟並觸發）
+    // 6. 建立結果事件（DLL 以 pid 衍生名稱開啟並觸發）。
+    //    具名核心物件隨最後一個 handle 消失：這裡必須**持有** handle 到補丁流程結束，
+    //    立刻 CloseHandle 會讓 DLL 端 OpenEventW 回 err=2（2026-10-30 實測）。
     let (done_name, fail_name) = event_names(pid);
+    let mut event_handles: Vec<windows::Win32::Foundation::HANDLE> = Vec::new();
     unsafe {
         for name in [&done_name, &fail_name] {
             let w = wide(name);
             match CreateEventW(None, true, false, PCWSTR(w.as_ptr())) {
-                Ok(h) => {
-                    let _ = CloseHandle(h);
-                }
+                Ok(h) => event_handles.push(h),
                 Err(e) => {
+                    for h in &event_handles {
+                        let _ = CloseHandle(*h);
+                    }
                     let _ = CloseHandle(pi.hThread);
                     let _ = CloseHandle(pi.hProcess);
                     return Err(format!("CreateEventW({name}) 失敗：{e}"));
@@ -307,6 +311,9 @@ pub fn launch_inproc(profile: &ServerProfile, log: LogHandle) -> Result<(), Stri
 
     let _ = unsafe { CloseHandle(pi.hThread) };
     let _ = unsafe { CloseHandle(pi.hProcess) };
+    for h in event_handles {
+        let _ = unsafe { CloseHandle(h) };
+    }
 
     match patch_result {
         Ok(rc @ (RC_OK | RC_ALREADY_PATCHED)) => {
@@ -328,6 +335,65 @@ fn GetLastError() -> u32 {
     // windows crate 0.61 的錯誤多以 Result 呈現；此處僅供 VirtualAllocEx 這類
     // 以指標回報失敗的 API 取最後錯誤碼。
     unsafe { windows::Win32::Foundation::GetLastError().0 }
+}
+
+/// 終止「同名但非本行程」的登入器實例（含殘留 daemon 與未關閉的舊視窗）。
+/// 場景：舊實例占住中繼埠，新實例（提權）可終止同使用者同名行程後重綁。
+/// 刻意只比對自身 exe 檔名，絕不碰客戶端（Lin.bin／LogonX64）或其他程序。
+pub fn terminate_stale_launcher_instances(log: &LogHandle) -> usize {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    let Ok(self_exe) = std::env::current_exe() else {
+        return 0;
+    };
+    let Some(self_name) = self_exe.file_name().map(|s| s.to_string_lossy().to_lowercase()) else {
+        return 0;
+    };
+    let me = std::process::id();
+    let mut killed = 0usize;
+    unsafe {
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            Err(_) => return 0,
+        };
+        let mut pe = PROCESSENTRY32W::default();
+        pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut pe).is_ok() {
+            loop {
+                let end = pe
+                    .szExeFile
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(pe.szExeFile.len());
+                let name = String::from_utf16_lossy(&pe.szExeFile[..end]).to_lowercase();
+                if name == self_name && pe.th32ProcessID != me {
+                    match OpenProcess(PROCESS_TERMINATE, false, pe.th32ProcessID) {
+                        Ok(h) => {
+                            if TerminateProcess(h, 2).is_ok() {
+                                killed += 1;
+                                log.info(format!(
+                                    "已終止殘留登入器實例 pid {}（佔用中繼埠）",
+                                    pe.th32ProcessID
+                                ));
+                            }
+                            let _ = CloseHandle(h);
+                        }
+                        Err(_) => {}
+                    }
+                }
+                if Process32NextW(snap, &mut pe).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    killed
 }
 
 /// 交棒：以 DETACHED_PROCESS 啟動自身 --relay-daemon，讓 UI 退出後中繼不斷線。
