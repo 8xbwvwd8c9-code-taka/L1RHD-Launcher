@@ -11,11 +11,37 @@
 use crate::logging::{Lvl, LogHandle};
 use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
 use std::os::windows::io::FromRawSocket;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+
+/// 登入封包採證開關（launcher.json `packet_capture`，預設關閉）。
+/// 0=關、1=開。開啟時僅記錄「客戶端→伺服端、首位元組為 opcode 199（C_AUTH_LOGIN）」
+/// 封包的**前 32 位元組** hex，供登入協定對位診斷；帳密欄位完整內容不落地。
+static AUTH_CAPTURE: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_auth_capture(on: bool) {
+    AUTH_CAPTURE.store(if on { 1 } else { 0 }, Ordering::SeqCst);
+}
+
+/// 條件成立時回傳前 32 位元組 hex 字串；否則 None。
+fn auth_capture_prefix(buf: &[u8]) -> Option<String> {
+    if AUTH_CAPTURE.load(Ordering::SeqCst) != 1 {
+        return None;
+    }
+    if buf.is_empty() || buf[0] != 0xC7 {
+        return None;
+    }
+    let n = buf.len().min(32);
+    let mut s = String::with_capacity(n * 3);
+    for b in &buf[..n] {
+        s.push_str(&format!("{:02X} ", b));
+    }
+    s.pop();
+    Some(s)
+}
 
 pub struct RelayHandle {
     pub bound: Vec<(u16, SocketAddr)>,
@@ -292,6 +318,11 @@ where
         }
         total += n as u64;
         log.info(format!("[#{seq}] {tag} {n} bytes"));
+        if tag == "C>S" {
+            if let Some(hex) = auth_capture_prefix(&buf[..n]) {
+                log.info(format!("[#{seq}] AUTH-PKT {hex}"));
+            }
+        }
         w.write_all(&buf[..n]).await?;
         w.flush().await?;
     }
@@ -332,10 +363,49 @@ async fn pump(
     }
 }
 
+/// 偵測本機是否已有中繼在服務這些 listen 埠（daemon 常駐設計：登入器重開時沿用，不重綁）。
+pub fn existing_relay_on(ports: &[u16]) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    !ports.is_empty()
+        && ports.iter().all(|&p| {
+            match format!("127.0.0.1:{p}").parse::<SocketAddr>() {
+                Ok(a) => TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok(),
+                Err(_) => false,
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn existing_relay_detects_live_local_listener() {
+        use std::net::TcpListener;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(existing_relay_on(&[port]));
+        // 埠 1 不可連（保留埠），應判定為無既有中繼
+        assert!(!existing_relay_on(&[1]));
+        assert!(!existing_relay_on(&[]));
+        drop(l);
+    }
+
+    #[test]
+    fn auth_capture_gated_and_masked() {
+        let payload = [0xC7u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        set_auth_capture(false);
+        assert!(auth_capture_prefix(&payload).is_none());
+        set_auth_capture(true);
+        let hex = auth_capture_prefix(&payload).unwrap();
+        assert!(hex.starts_with("C7 01 02"));
+        // 非 199 開頭的封包不採證
+        let other = [0xF4u8, 1];
+        assert!(auth_capture_prefix(&other).is_none());
+        set_auth_capture(false);
+    }
 
     #[tokio::test]
     async fn forwards_payload_without_recording_its_contents() {

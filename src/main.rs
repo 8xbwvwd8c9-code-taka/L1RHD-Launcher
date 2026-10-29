@@ -50,6 +50,7 @@ fn main() {
     log.info(format!("管理員權限 = {}", elevate::is_admin()));
 
     let cfg = config::load();
+    relay::set_auth_capture(cfg.packet_capture);
 
     let opts = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -84,6 +85,9 @@ fn relay_daemon_mode() {
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     log.set_dir(exe_dir);
     log.info("── 常駐中繼模式啟動 ──");
+
+    let capture = config::load().packet_capture;
+    relay::set_auth_capture(capture);
 
     let profiles = match servers::load() {
         Ok(v) => v,

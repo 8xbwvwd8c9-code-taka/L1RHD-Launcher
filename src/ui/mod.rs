@@ -29,6 +29,10 @@ enum Phase {
     Failed,
 }
 
+/// 啟動執行緒的結果通道：boot_sequence 改在背景執行緒跑 launch_inproc，
+/// 補丁等待（最長約 130 秒）期間 UI 保持回應，不再出現「登入器當機」觀感。
+type LaunchRx = std::sync::mpsc::Receiver<Result<(), String>>;
+
 fn launch_hold_status(process: Result<Option<String>, String>) -> String {
     match process {
         Ok(Some(name)) => format!("偵測到既有遊戲 {name}，請先自行關閉"),
@@ -55,6 +59,7 @@ pub struct LauncherApp {
     client_proc: Option<String>,
     last_probe: Instant,
     queued: bool,
+    launch_result: Option<LaunchRx>,
 }
 
 impl LauncherApp {
@@ -63,6 +68,7 @@ impl LauncherApp {
         theme::install_style(&cc.egui_ctx);
         crate::logging::set_repaint_ctx(cc.egui_ctx.clone());
         widgets::install_bg(&cc.egui_ctx);
+        relay::set_auth_capture(cfg.packet_capture);
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -99,6 +105,7 @@ impl LauncherApp {
             client_proc: None,
             last_probe: Instant::now() - Duration::from_secs(10),
             queued: false,
+            launch_result: None,
         }
     }
 
@@ -180,25 +187,57 @@ impl LauncherApp {
         }
 
         self.log.info("進入遊戲：進程內補丁路線（rhd_inproc.dll）");
-        match inproc::launch_inproc(&p, self.log.clone()) {
-            Ok(()) => {
-                self.phase = Phase::Booting;
-                self.status = "遊戲已啟動".into();
-                // 交棒：釋放 listen 埠 → 常駐中繼 daemon 接管 → 登入器數秒後退出，
-                // 客戶端長連線不受登入器關閉影響。
-                self.stop_all();
-                inproc::spawn_relay_daemon(&self.log);
-                let exit_log = self.log.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(3));
-                    exit_log.info("登入器退出（中繼由 daemon 接管）");
-                    std::process::exit(0);
-                });
+        // 背景執行緒執行完整啟動鏈；UI 只輪詢結果（修復：等待期間不再凍結視窗）
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let profile = p.clone();
+        let log2 = self.log.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(inproc::launch_inproc(&profile, log2));
+        });
+        self.launch_result = Some(rx);
+        self.phase = Phase::Booting;
+        self.status = "啟動中：等待客戶端脫殼與進程內補丁（最長約 2 分鐘）…".into();
+        self.log.info(self.status.clone());
+    }
+
+    /// 啟動成功收尾：交棒常駐中繼 daemon → 釋放 listen 埠 → 約 3 秒後退出。
+    fn finish_boot_ok(&mut self) {
+        self.log.info("遊戲已啟動並完成進程內補丁；登入器交棒常駐中繼後退出");
+        self.stop_all();
+        inproc::spawn_relay_daemon(&self.log);
+        let exit_log = self.log.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            exit_log.info("登入器退出（中繼由 daemon 接管）");
+            std::process::exit(0);
+        });
+    }
+
+    /// 輪詢背景啟動結果；每幀呼叫。
+    fn poll_launch_result(&mut self) {
+        if self.phase != Phase::Booting {
+            return;
+        }
+        let Some(rx) = &self.launch_result else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.launch_result = None;
+                self.finish_boot_ok();
             }
-            Err(e) => {
+            Ok(Err(e)) => {
+                self.launch_result = None;
                 self.phase = Phase::Failed;
                 self.status = e.clone();
                 self.log.error(e);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.launch_result = None;
+                self.phase = Phase::Failed;
+                self.status = "啟動執行緒異常結束（無結果回傳）".into();
+                self.log.error(self.status.clone());
             }
         }
     }
@@ -221,8 +260,16 @@ impl LauncherApp {
                 true
             }
             Err(e) => {
-                self.log.error(format!("中繼啟動失敗：{e}"));
-                false
+                // 常駐 daemon 設計為不退出：登入器重開時全部 listen 埠已被本機
+                // 既有中繼服務中 → 沿用它，不擋啟動（修復：重開顯示「中繼失敗」）
+                if relay::existing_relay_on(&p.listen_ports) {
+                    self.log
+                        .info("偵測到既有常駐中繼（埠已服務中），沿用不重綁".to_string());
+                    true
+                } else {
+                    self.log.error(format!("中繼啟動失敗：{e}"));
+                    false
+                }
             }
         }
     }
@@ -309,6 +356,7 @@ impl eframe::App for LauncherApp {
         self.probe();
 
         // 啟動時只掛上中繼，不自動進遊戲（等使用者按「進入遊戲」）
+        self.poll_launch_result();
         if !self.queued {
             self.queued = true;
             if self.current().is_some() {
@@ -464,9 +512,15 @@ impl eframe::App for LauncherApp {
 
         // 狀態文字
         let status_text = match self.phase {
-            Phase::Idle => "已選擇伺服器",
-            Phase::Booting => "準備中",
-            Phase::Failed => self.status.as_str(),
+            Phase::Idle => "已選擇伺服器".to_string(),
+            Phase::Booting => {
+                if self.status.is_empty() {
+                    "準備中".to_string()
+                } else {
+                    self.status.clone()
+                }
+            }
+            Phase::Failed => self.status.clone(),
         };
         let sy = if show_btn {
             win_h - 86.0

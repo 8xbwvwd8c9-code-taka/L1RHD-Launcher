@@ -28,6 +28,9 @@ pub struct AppConfig {
     /// false = 維持「安全驗證未完成」的停用狀態，不啟動遊戲。
     #[serde(default = "def_true")]
     pub inproc_launch: bool,
+    /// 登入封包採證（opcode 199 前 32 位元組 hex 記入中繼日誌；預設關閉，診斷用）。
+    #[serde(default)]
+    pub packet_capture: bool,
 }
 
 fn def_true() -> bool {
@@ -44,6 +47,7 @@ impl Default for AppConfig {
             minimize_to_tray: true,
             last_server: String::new(),
             inproc_launch: true,
+            packet_capture: false,
         }
     }
 }
