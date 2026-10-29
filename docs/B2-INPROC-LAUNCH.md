@@ -94,6 +94,14 @@ fixture 驗證不等於遊戲驗收：保護驅動對進程內寫入的相容性
 都必須由持有客戶端與伺服器的人自行驗證。驗收指標與回退方式（`inproc_launch=false`
 一鍵停用）見上節；發生整機凍結時請保留 Windows 事件檢視器證據，勿以調整時序參數代替根因分析。
 
+## 伺服端明文契約（固化，禁止還原）
+
+B2 路線成立的前提之一，是伺服端維持「**雙端明文**」契約：
+
+- 伺服器**不得發送 KeyPacket**（opcode 15）。天R x64 客戶端收到 opcode 15 後會鎖進加密模式（下行 RC4、上行 CBC＋4-byte 序號），而 L1RHD 核心的 `LineagePacketEncoder/Decoder` 全程明文（`LineageEncryption` 死代碼、`mina/Cipher.decryptClient` 零呼叫）——雙端錯位後 opcode 199 登入封包 body 變密文，`C_AuthLogin` 解析失敗（症狀：服務端印「不合法帳號長度」、客戶端 error code [0]）。
+- 該發送已於 2026-10-24（處方A）與 2026-10-30（回歸後重新套用）兩度停發並實測；**任何代理人不得重新啟用**。未來若要支援加密模式，必須先實裝並驗證完整伺服端解密層，另立決策記錄。
+- 回歸閘門：`checks\verify-keypacket-stopped.ps1`（GateA 源碼無未註解發送＋GateB gs.jar 編譯產物零 KeyPacket 引用）。
+
 ## 已知限制
 
 - 客戶端 `bin64/Lin.bin` 內嵌 `requireAdministrator`：全鏈提權是硬需求。
