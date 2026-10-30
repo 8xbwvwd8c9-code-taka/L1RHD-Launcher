@@ -8,7 +8,7 @@
 //!   - DLL 以「pid 衍生」具名事件回報結果（Local\RHDInprocDone-<pid> / Fail-<pid>），
 //!     本模組在取得 pid 後建立同名事件對接。
 //!
-//! 失敗時不終止客戶端（由使用者自行關閉）；只回報錯誤狀態。
+//! 放行主執行緒前失敗會終止並等待新客戶端；放行後的補丁失敗則由使用者自行關閉。
 
 use crate::logging::LogHandle;
 use crate::servers::ServerProfile;
@@ -146,7 +146,7 @@ pub fn launch_inproc(profile: &ServerProfile, log: LogHandle) -> Result<(), Stri
     use windows::Win32::Foundation::WAIT_OBJECT_0;
 
     // 1. 前置檢查：客戶端不得已在執行；檢查失敗不得視為「沒有遊戲」
-    match crate::launch::client_process_running() {
+    match crate::launch::client_process_running(&profile.game_dir) {
         Ok(Some(name)) => return Err(format!("偵測到既有遊戲 {name}，請先自行關閉")),
         Ok(None) => {}
         Err(e) => return Err(format!("無法檢查遊戲程序：{e}")),
@@ -233,18 +233,26 @@ pub fn launch_inproc(profile: &ServerProfile, log: LogHandle) -> Result<(), Stri
         Ok(())
     })();
     if let Err(e) = inject_result {
+        let cleanup = terminate_suspended_process(pi.hProcess);
         let _ = unsafe { CloseHandle(pi.hThread) };
         let _ = unsafe { CloseHandle(pi.hProcess) };
-        return Err(e);
+        return Err(match cleanup {
+            Ok(()) => e,
+            Err(cleanup_error) => format!("{e}；清理掛起客戶端失敗：{cleanup_error}"),
+        });
     }
     log.info("rhd_inproc.dll 已注入");
 
     // 5. 放行主執行緒（SecureEngine 開始脫殼）
     let resumed = unsafe { ResumeThread(pi.hThread) };
     if resumed == u32::MAX {
+        let cleanup = terminate_suspended_process(pi.hProcess);
         let _ = unsafe { CloseHandle(pi.hThread) };
         let _ = unsafe { CloseHandle(pi.hProcess) };
-        return Err("ResumeThread 失敗".into());
+        return Err(match cleanup {
+            Ok(()) => "ResumeThread 失敗".into(),
+            Err(cleanup_error) => format!("ResumeThread 失敗；清理掛起客戶端失敗：{cleanup_error}"),
+        });
     }
 
     // 6. 建立結果事件（DLL 以 pid 衍生名稱開啟並觸發）。
@@ -329,6 +337,20 @@ pub fn launch_inproc(profile: &ServerProfile, log: LogHandle) -> Result<(), Stri
         )),
         Err(e) => Err(e),
     }
+}
+
+// FIX: TR-BUG-559 放行前失敗終止並等待新客戶端 - [已修復但未實機測試]
+fn terminate_suspended_process(process: windows::Win32::Foundation::HANDLE) -> Result<(), String> {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+    unsafe {
+        TerminateProcess(process, 1).map_err(|e| format!("TerminateProcess：{e}"))?;
+    }
+    if unsafe { WaitForSingleObject(process, 5000) } != WAIT_OBJECT_0 {
+        return Err("等待子程序退出逾時或失敗".into());
+    }
+    Ok(())
 }
 
 fn GetLastError() -> u32 {
@@ -470,5 +492,52 @@ mod tests {
         for rc in [RC_OK, RC_ALREADY_PATCHED, RC_NO_MODULE, RC_TIMEOUT, RC_PREIMAGE, RC_PROTECT, RC_WRITE, RC_UNSAFE] {
             assert!(!describe_rc(rc).starts_with("未知"));
         }
+    }
+
+    #[test]
+    fn failed_suspended_child_is_terminated_and_waited() {
+        use windows::core::{PCWSTR, PWSTR};
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{
+            CreateProcessW, TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED,
+            PROCESS_INFORMATION, STARTUPINFOW,
+        };
+
+        let exe_path = std::env::var("COMSPEC").expect("COMSPEC must identify cmd.exe");
+        let exe = wide(&exe_path);
+        let mut command = wide(&format!("\"{exe_path}\" /c exit 0"));
+        let mut startup = STARTUPINFOW::default();
+        startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut child = PROCESS_INFORMATION::default();
+        unsafe {
+            CreateProcessW(
+                PCWSTR(exe.as_ptr()),
+                Some(PWSTR(command.as_mut_ptr())),
+                None,
+                None,
+                false,
+                CREATE_SUSPENDED,
+                None,
+                PCWSTR::null(),
+                &startup,
+                &mut child,
+            )
+            .expect("create isolated suspended cmd.exe");
+        }
+
+        let cleanup = terminate_suspended_process(child.hProcess);
+        let wait = unsafe { WaitForSingleObject(child.hProcess, 1000) };
+        if wait != WAIT_OBJECT_0 {
+            unsafe {
+                let _ = TerminateProcess(child.hProcess, 1);
+                let _ = WaitForSingleObject(child.hProcess, 5000);
+            }
+        }
+        unsafe {
+            let _ = CloseHandle(child.hThread);
+            let _ = CloseHandle(child.hProcess);
+        }
+        cleanup.expect("terminate and wait for isolated child");
+        assert_eq!(wait, WAIT_OBJECT_0, "child must be signaled before return");
     }
 }

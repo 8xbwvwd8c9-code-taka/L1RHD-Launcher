@@ -68,7 +68,13 @@ impl LauncherApp {
         theme::install_style(&cc.egui_ctx);
         crate::logging::set_repaint_ctx(cc.egui_ctx.clone());
         widgets::install_bg(&cc.egui_ctx);
-        relay::set_auth_capture(cfg.packet_capture);
+        relay::apply_config(
+            cfg.packet_capture,
+            cfg.proxy_login,
+            &cfg.login_account,
+            &cfg.login_password,
+            cfg.inject_s_key,
+        );
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -143,9 +149,13 @@ impl LauncherApp {
             let (h, port) = (p.host.clone(), p.port);
             self.target_ok = launch::target_alive(&h, port, Duration::from_millis(500));
         }
-        self.client_proc = match launch::client_process_running() {
-            Ok(process) => process,
-            Err(e) => Some(format!("無法檢查遊戲程序：{e}")),
+        let game_dir = self.current().map(|p| p.game_dir.clone());
+        self.client_proc = match game_dir.as_deref() {
+            Some(game_dir) => match launch::client_process_running(game_dir) {
+                Ok(process) => process,
+                Err(e) => Some(format!("無法檢查遊戲程序：{e}")),
+            },
+            None => None,
         };
     }
 
@@ -154,7 +164,12 @@ impl LauncherApp {
     /// 前置檢查失敗（既有程序、程序盤點錯誤）一律不啟動；inproc_launch=false 時
     /// 維持停用狀態。補丁由自製 DLL 在客戶端進程內完成，啟動器只寫入注入路徑字串。
     fn boot_sequence(&mut self) {
-        match launch::client_process_running() {
+        let Some(p) = self.current().cloned() else {
+            self.phase = Phase::Failed;
+            self.status = "沒有伺服器設定".into();
+            return;
+        };
+        match launch::client_process_running(&p.game_dir) {
             Ok(Some(name)) => {
                 self.phase = Phase::Failed;
                 self.status = format!("偵測到既有遊戲 {name}，請先自行關閉");
@@ -175,11 +190,6 @@ impl LauncherApp {
             self.log.info(self.status.clone());
             return;
         }
-        let Some(p) = self.current().cloned() else {
-            self.phase = Phase::Failed;
-            self.status = "沒有伺服器設定".into();
-            return;
-        };
         if !self.ensure_relay_for(&p) {
             self.phase = Phase::Failed;
             self.status = "中繼啟動失敗，未啟動遊戲".into();

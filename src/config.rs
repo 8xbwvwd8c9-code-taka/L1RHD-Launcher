@@ -31,6 +31,21 @@ pub struct AppConfig {
     /// 登入封包採證（opcode 199 前 32 位元組 hex 記入中繼日誌；預設關閉，診斷用）。
     #[serde(default)]
     pub packet_capture: bool,
+    /// 登入代理：把客戶端送出的第一個 opcode 199 改寫成明文帳密包。
+    /// 用於 direct_launch 直接啟動 Lin.bin 的情境——客戶端自己送的 199 不是伺服端
+    /// `C_AuthLogin` 認得的 `account\0password\0` 佈局。預設關閉。
+    #[serde(default)]
+    pub proxy_login: bool,
+    /// 登入代理帳號（2–14 字元、ASCII）。
+    #[serde(default)]
+    pub login_account: String,
+    /// 登入代理密碼（4–16 字元、ASCII）。
+    #[serde(default)]
+    pub login_password: String,
+    /// 中繼補發 S_KEY（opcode 15）。服務端依 ADR-005 停發，客戶端收不到就完全不
+    /// 送任何封包（實測 36～168 秒上下行 0 bytes 後自行關線）。預設關閉。
+    #[serde(default)]
+    pub inject_s_key: bool,
 }
 
 fn def_true() -> bool {
@@ -48,6 +63,10 @@ impl Default for AppConfig {
             last_server: String::new(),
             inproc_launch: true,
             packet_capture: false,
+            proxy_login: false,
+            login_account: String::new(),
+            login_password: String::new(),
+            inject_s_key: false,
         }
     }
 }
@@ -62,6 +81,27 @@ mod tests {
         assert!(cfg.inproc_launch);
         let off: AppConfig = serde_json::from_str(r#"{"inproc_launch": false}"#).unwrap();
         assert!(!off.inproc_launch);
+    }
+
+    #[test]
+    fn proxy_login_defaults_to_disabled() {
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.proxy_login);
+        assert!(cfg.login_account.is_empty());
+        let on: AppConfig = serde_json::from_str(
+            r#"{"proxy_login": true, "login_account": "test01", "login_password": "test01"}"#,
+        )
+        .unwrap();
+        assert!(on.proxy_login);
+        assert_eq!(on.login_account, "test01");
+    }
+
+    #[test]
+    fn inject_s_key_defaults_to_disabled() {
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.inject_s_key);
+        let on: AppConfig = serde_json::from_str(r#"{"inject_s_key": true}"#).unwrap();
+        assert!(on.inject_s_key);
     }
 }
 

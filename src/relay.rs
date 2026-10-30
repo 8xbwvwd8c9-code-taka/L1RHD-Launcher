@@ -43,6 +43,139 @@ fn auth_capture_prefix(buf: &[u8]) -> Option<String> {
     Some(s)
 }
 
+/// 登入代理設定（launcher.json `proxy_login`）。None = 純透傳。
+///
+/// 背景：B2 以 `direct_launch` 直接啟動 `bin64\Lin.bin` 時，客戶端送出的第一個
+/// opcode 199 不是伺服端 `C_AuthLogin` 認得的 `account\0password\0` 佈局
+/// （2026-10-30 實測 288B 高熵 body + 明文尾端），伺服端必然回「帳號長度不合法」。
+/// 原版流程是 `Login.exe` 自己發明文帳密包（2026-10-24 實錄 17B），再把會話交給
+/// Lin.bin；本改寫器就是把這件事搬進中繼——只換 199 的 body，其餘位元組原封不動。
+/// 不改客戶端、不改服務端，雙端仍全明文（符合 ADR-005）。
+static PROXY_LOGIN: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// 補發 S_KEY（伺服端 opcode 15）開關（launcher.json `inject_s_key`，預設關閉）。
+///
+/// ADR-005 讓伺服端永久停發 KeyPacket，而客戶端沒收到這一幀就完全不進入登入
+/// 流程：2026-10-30 多次實測，連上中繼後 36～168 秒上下行皆 0 bytes，最後自己
+/// 關線並彈「目前無法使用此伺服器」。中繼代伺服端補上這一幀，客戶端才會送出
+/// 161B（opcode 244）＋295B（opcode 199），後續登入代理才有東西可改寫。
+///
+/// 內容取自伺服端 `KeyPacket.java` 的固定種子；與 2026-10-24 實錄的 13 bytes
+/// （`0D 00 0F 42 90 E1 7A A4 29 70 53 00 00`）逐位元組相同。
+const S_KEY_FRAME: [u8; 13] = [
+    0x0D, 0x00, 0x0F, 0x42, 0x90, 0xE1, 0x7A, 0xA4, 0x29, 0x70, 0x53, 0x00, 0x00,
+];
+
+static INJECT_S_KEY: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_inject_s_key(on: bool) {
+    INJECT_S_KEY.store(if on { 1 } else { 0 }, Ordering::SeqCst);
+}
+
+fn inject_s_key_on() -> bool {
+    INJECT_S_KEY.load(Ordering::SeqCst) == 1
+}
+
+pub fn set_proxy_login(creds: Option<(String, String)>) {
+    *PROXY_LOGIN.lock().unwrap_or_else(|e| e.into_inner()) = creds;
+}
+
+fn proxy_login_creds() -> Option<(String, String)> {
+    PROXY_LOGIN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 依 launcher.json 一次套用中繼行為（封包採證＋登入代理＋補發 S_KEY）。
+/// UI 主路徑、常駐 daemon 與視窗建構三處共用，避免各自漏設。
+pub fn apply_config(
+    capture: bool,
+    proxy: bool,
+    account: &str,
+    password: &str,
+    inject_s_key: bool,
+) {
+    set_auth_capture(capture);
+    set_inject_s_key(inject_s_key);
+    if proxy && !account.is_empty() && !password.is_empty() {
+        set_proxy_login(Some((account.to_string(), password.to_string())));
+    } else {
+        set_proxy_login(None);
+    }
+}
+
+/// 幀格式：`[u16 LE total（含前綴）][4B 序號][opcode][body]`。
+/// 只改第一個 opcode 199（`C_AuthLogin`），序號沿用客戶端原值。
+struct LoginRewrite {
+    account: Vec<u8>,
+    password: Vec<u8>,
+    pending: Vec<u8>,
+    done: bool,
+}
+
+impl LoginRewrite {
+    /// 帳號 2–14、密碼 4–16（伺服端 `C_AuthLogin` 閘門），且限 ASCII。
+    fn new(account: &str, password: &str) -> Option<Self> {
+        if !account.is_ascii() || !password.is_ascii() {
+            return None;
+        }
+        if !(2..=14).contains(&account.len()) || !(4..=16).contains(&password.len()) {
+            return None;
+        }
+        Some(Self {
+            account: account.as_bytes().to_vec(),
+            password: password.as_bytes().to_vec(),
+            pending: Vec::new(),
+            done: false,
+        })
+    }
+
+    fn login_frame(&self, seq: &[u8], total_len: &mut u64) -> Vec<u8> {
+        let body = self.account.len() + 1 + self.password.len() + 1;
+        let total = 7 + body;
+        let mut f = Vec::with_capacity(total);
+        f.extend_from_slice(&(total as u16).to_le_bytes());
+        f.extend_from_slice(seq);
+        f.push(0xC7);
+        f.extend_from_slice(&self.account);
+        f.push(0);
+        f.extend_from_slice(&self.password);
+        f.push(0);
+        *total_len += total as u64;
+        f
+    }
+
+    /// 吃任意切片，吐出要送往上游的位元組（可為空；跨讀塊的殘幀留在 pending）。
+    fn push(&mut self, input: &[u8], rewritten: &mut u64) -> Vec<u8> {
+        self.pending.extend_from_slice(input);
+        let mut out = Vec::new();
+        loop {
+            if self.pending.len() < 2 {
+                break;
+            }
+            let total = u16::from_le_bytes([self.pending[0], self.pending[1]]) as usize;
+            // 幀長不合理（<7 或 >16KiB）就不猜，整段原樣放行，避免卡死連線。
+            if !(7..=16384).contains(&total) {
+                out.extend_from_slice(&self.pending);
+                self.pending.clear();
+                break;
+            }
+            if self.pending.len() < total {
+                break;
+            }
+            let frame: Vec<u8> = self.pending.drain(..total).collect();
+            if !self.done && frame[6] == 0xC7 {
+                out.extend_from_slice(&self.login_frame(&frame[2..6], rewritten));
+                self.done = true;
+            } else {
+                out.extend_from_slice(&frame);
+            }
+        }
+        out
+    }
+}
+
 pub struct RelayHandle {
     pub bound: Vec<(u16, SocketAddr)>,
     #[allow(dead_code)]
@@ -261,6 +394,8 @@ async fn accept_loop(
                         let t = target.clone();
                         let lg = log.clone();
                         let rx = stop_rx.clone();
+                        let rewrite = proxy_login_creds()
+                            .and_then(|(a, p)| LoginRewrite::new(&a, &p));
                         tokio::spawn(async move {
                             let peer_ip = if peer.is_ipv6() {
                                 format!("[{}]", peer.ip())
@@ -274,7 +409,13 @@ async fn accept_loop(
                             match TcpStream::connect(&t).await {
                                 Ok(outbound) => {
                                     lg.info(format!("[#{seq}] 已接上 {t}"));
-                                    pump(inbound, outbound, seq, lg, rx).await;
+                                    if rewrite.is_some() {
+                                        lg.info(format!(
+                                            "[#{seq}] 登入代理啟用：第一個 opcode 199 將改寫為明文帳密包"
+                                        ));
+                                    }
+                                    let inject = inject_s_key_on();
+                                    pump(inbound, outbound, seq, lg, rx, rewrite, inject).await;
                                 }
                                 Err(e) => {
                                     lg.error(format!(
@@ -328,21 +469,81 @@ where
     Ok(total)
 }
 
+/// C>S 方向：可選的登入代理改寫。日誌只記方向、長度與「已改寫」，不記帳密。
+async fn pipe_client_to_server<R, W>(
+    mut r: R,
+    mut w: W,
+    seq: u64,
+    log: LogHandle,
+    mut rewrite: Option<LoginRewrite>,
+) -> std::io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 16384];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        log.info(format!("[#{seq}] C>S {n} bytes"));
+        if let Some(hex) = auth_capture_prefix(&buf[..n]) {
+            log.info(format!("[#{seq}] PKT-C>S {hex}"));
+        }
+        let out = match rewrite.as_mut() {
+            Some(rw) => {
+                let mut rewritten = 0u64;
+                let out = rw.push(&buf[..n], &mut rewritten);
+                if rewritten > 0 {
+                    log.info(format!(
+                        "[#{seq}] 登入代理：opcode 199 已改寫為明文帳密包（{rewritten} bytes；客戶端原送 {n} bytes）"
+                    ));
+                }
+                out
+            }
+            None => buf[..n].to_vec(),
+        };
+        if !out.is_empty() {
+            w.write_all(&out).await?;
+            w.flush().await?;
+        }
+    }
+    let _ = w.shutdown().await;
+    Ok(total)
+}
+
 async fn pump(
     mut inbound: TcpStream,
     mut outbound: TcpStream,
     seq: u64,
     log: LogHandle,
     mut stop_rx: watch::Receiver<bool>,
+    rewrite: Option<LoginRewrite>,
+    inject_s_key: bool,
 ) {
     let _ = inbound.set_nodelay(true);
     let _ = outbound.set_nodelay(true);
-    let (ir, iw) = inbound.split();
+    let (ir, mut iw) = inbound.split();
     let (or_, ow) = outbound.split();
+
+    // 伺服端停發 S_KEY；客戶端沒收到就不送任何封包。要在雙向 pump 之前補上。
+    if inject_s_key {
+        match iw.write_all(&S_KEY_FRAME).await {
+            Ok(()) => log.info(format!(
+                "[#{seq}] 補發 S_KEY（opcode 15，{} bytes；伺服端依 ADR-005 停發）",
+                S_KEY_FRAME.len()
+            )),
+            Err(e) => log.warn(format!("[#{seq}] 補發 S_KEY 失敗：{e}")),
+        }
+    }
 
     // 兩個方向獨立進行，任一方向 EOF 只關閉該方向，不強制中斷另一方向
     // （比照 relay_debug.py 的 settimeout(None) 行為，避免遊戲長連線被切斷）
-    let up = pipe_with_log(ir, ow, "C>S", seq, log.clone());
+    let up = pipe_client_to_server(ir, ow, seq, log.clone(), rewrite);
     let down = pipe_with_log(or_, iw, "S>C", seq, log.clone());
 
     tokio::select! {
@@ -378,6 +579,76 @@ pub fn existing_relay_on(ports: &[u16]) -> bool {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn frame244() -> Vec<u8> {
+        let mut f = vec![0xA1, 0x00, 0x01, 0x00, 0x00, 0x00, 0xF4];
+        f.extend(std::iter::repeat(0x11).take(154));
+        f
+    }
+
+    fn frame199() -> Vec<u8> {
+        let mut f = vec![0x27, 0x01, 0x02, 0x00, 0x00, 0x00, 0xC7];
+        f.extend(std::iter::repeat(0x22).take(288));
+        f
+    }
+
+    #[test]
+    fn login_rewrite_replaces_first_199_with_plain_credentials() {
+        let mut rw = LoginRewrite::new("5566", "5566").unwrap();
+        let mut rewritten = 0u64;
+        let out = rw.push(&frame199(), &mut rewritten);
+        assert_eq!(out.len(), 17);
+        assert_eq!(&out[..7], &[0x11, 0x00, 0x02, 0x00, 0x00, 0x00, 0xC7]);
+        assert_eq!(
+            &out[7..],
+            &[b'5', b'5', b'6', b'6', 0, b'5', b'5', b'6', b'6', 0]
+        );
+        assert_eq!(rewritten, 17);
+    }
+
+    #[test]
+    fn login_rewrite_leaves_handshake_frame_untouched() {
+        let mut rw = LoginRewrite::new("5566", "5566").unwrap();
+        let f = frame244();
+        let mut rewritten = 0u64;
+        let out = rw.push(&f, &mut rewritten);
+        assert_eq!(out, f);
+        assert_eq!(rewritten, 0);
+    }
+
+    #[test]
+    fn login_rewrite_handles_split_and_coalesced_frames() {
+        let mut rw = LoginRewrite::new("5566", "5566").unwrap();
+        let f244 = frame244();
+        let mut stream = f244.clone();
+        stream.extend_from_slice(&frame199());
+        let (a, b) = stream.split_at(3);
+        let mut rewritten = 0u64;
+        assert!(rw.push(a, &mut rewritten).is_empty());
+        let out = rw.push(b, &mut rewritten);
+        assert_eq!(out.len(), f244.len() + 17);
+        assert_eq!(&out[..f244.len()], &f244[..]);
+        assert_eq!(rewritten, 17);
+    }
+
+    #[test]
+    fn login_rewrite_only_first_199() {
+        let mut rw = LoginRewrite::new("5566", "5566").unwrap();
+        let mut rewritten = 0u64;
+        let f = frame199();
+        let _ = rw.push(&f, &mut rewritten);
+        let second = rw.push(&f, &mut rewritten);
+        assert_eq!(second, f);
+        assert_eq!(rewritten, 17);
+    }
+
+    #[test]
+    fn login_rewrite_rejects_out_of_range_credentials() {
+        assert!(LoginRewrite::new("5", "5566").is_none());
+        assert!(LoginRewrite::new("5566", "556").is_none());
+        assert!(LoginRewrite::new("帳號", "5566").is_none());
+        assert!(LoginRewrite::new(&"a".repeat(15), "5566").is_none());
+    }
 
     #[test]
     fn existing_relay_detects_live_local_listener() {

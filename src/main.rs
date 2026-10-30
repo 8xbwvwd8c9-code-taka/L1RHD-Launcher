@@ -50,7 +50,13 @@ fn main() {
     log.info(format!("管理員權限 = {}", elevate::is_admin()));
 
     let cfg = config::load();
-    relay::set_auth_capture(cfg.packet_capture);
+    relay::apply_config(
+        cfg.packet_capture,
+        cfg.proxy_login,
+        &cfg.login_account,
+        &cfg.login_password,
+        cfg.inject_s_key,
+    );
 
     let opts = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -86,8 +92,14 @@ fn relay_daemon_mode() {
     log.set_dir(exe_dir);
     log.info("── 常駐中繼模式啟動 ──");
 
-    let capture = config::load().packet_capture;
-    relay::set_auth_capture(capture);
+    let cfg = config::load();
+    relay::apply_config(
+        cfg.packet_capture,
+        cfg.proxy_login,
+        &cfg.login_account,
+        &cfg.login_password,
+        cfg.inject_s_key,
+    );
 
     let profiles = match servers::load() {
         Ok(v) => v,
@@ -194,9 +206,12 @@ fn selftest() {
                 s.host_port(),
                 launch::target_alive(&s.host, s.port, std::time::Duration::from_secs(2))
             ));
+            log.info(format!(
+                "client_proc={:?}",
+                launch::client_process_running(&s.game_dir)
+            ));
         }
     }
-    log.info(format!("client_proc={:?}", launch::client_process_running()));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
