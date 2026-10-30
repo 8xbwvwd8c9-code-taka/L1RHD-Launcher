@@ -22,3 +22,8 @@
 /native/Testing/
 /native/CMakeCache.txt
 /native/CMakeFiles/
+# local agent / state dirs (not part of the project)
+/.serena/
+/native/.mimosa/
+/__pycache__/
+*.tar.gz
