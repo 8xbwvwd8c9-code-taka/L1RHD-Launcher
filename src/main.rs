@@ -20,6 +20,9 @@ mod updater;
 
 use logging::LogHandle;
 
+/// 建置標記：寫進啟動日誌，用於區分部署的 exe 版本（凍結取證對照用）。
+pub const BUILD_TAG: &str = "20261031-heartbeat1";
+
 fn main() {
     // 自檢模式：不開視窗，驗證 relay / hosts / cfg 讀寫
     if std::env::args().any(|a| a == "--selftest") {
@@ -48,6 +51,8 @@ fn main() {
     log.info("═══ RHD Launcher 啟動 ═══");
     log.info(format!("工作目錄 = {}", exe_dir.display()));
     log.info(format!("管理員權限 = {}", elevate::is_admin()));
+    log.info(format!("build = {BUILD_TAG}"));
+    log_freeze_risk(&log);
 
     let cfg = config::load();
     relay::apply_config(
@@ -91,6 +96,8 @@ fn relay_daemon_mode() {
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     log.set_dir(exe_dir);
     log.info("── 常駐中繼模式啟動 ──");
+    log.info(format!("build = {BUILD_TAG}"));
+    log_freeze_risk(&log);
 
     let cfg = config::load();
     relay::apply_config(
@@ -150,13 +157,71 @@ fn relay_daemon_mode() {
     ) {
         Ok(_h) => {
             log.info(format!("常駐中繼已就緒 -> {}", p.host_port()));
-            // 保持存活；_h 持有 listener，drop 會停止中繼
+            // 心跳（凍結取證）：每 10 秒記錄一次存活，凍結後重建時可把
+            // 系統凍結窗口收斂到 10 秒級（2026-10-31 採證筆記 §3.1-4）
+            log.info("心跳啟用：每 10 秒記錄常駐中繼存活");
+            let started = std::time::Instant::now();
+            let mut next_beat = 10u64;
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(3));
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let el = started.elapsed().as_secs();
+                if el >= next_beat {
+                    log.info(format!("心跳：常駐中繼存活 t={el}s"));
+                    next_beat = el + 10;
+                }
                 // 目標伺服器若消失也不退出，等它回來
             }
         }
         Err(e) => log.error(format!("常駐中繼啟動失敗：{e}")),
+    }
+}
+
+/// 啟動期凍結風險掃描（只讀，不改任何狀態）。
+/// 三嫌疑採證見 vault 筆記 20261031-天R登入器B4當機採證與歐霸天堂Login.exe反編譯取證 §1.3：
+/// ①IObit AscFileFilter 篩選驅動 ②SecureEngine/GG × 行程內補丁並行 ③D: 滿盤（僅限有 NTFS 140 時）。
+fn log_freeze_risk(log: &LogHandle) {
+    log.info(format!(
+        "凍結風險掃描：AscFileFilter={} D_free={}（嫌疑1=AscFileFilter 2=SE/GG×補丁 3=D:滿盤[僅限NTFS140]）",
+        ascfilefilter_state(),
+        d_free_gb()
+            .map(|g| format!("{g} GB"))
+            .unwrap_or_else(|| "?".to_string()),
+    ));
+}
+
+/// 查 IObit Advanced SystemCare 的 AscFileFilter 服務狀態。
+/// sc.exe 的 STATE 名稱各語系皆為英文（RUNNING/STOPPED）。
+fn ascfilefilter_state() -> &'static str {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("sc.exe")
+        .args(["query", "AscFileFilter"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output();
+    match out {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            if s.contains("RUNNING") {
+                "RUNNING"
+            } else if s.contains("STOPPED") {
+                "STOPPED"
+            } else {
+                "absent"
+            }
+        }
+        Err(_) => "unknown",
+    }
+}
+
+/// 查 D: 可用空間（GB）。槽不存在或查詢失敗回 None。
+fn d_free_gb() -> Option<u64> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let root: Vec<u16> = "D:\\\0".encode_utf16().collect();
+    let mut free: u64 = 0;
+    unsafe {
+        GetDiskFreeSpaceExW(PCWSTR(root.as_ptr()), None, None, Some(&mut free))
+            .ok()
+            .map(|_| free / 1024 / 1024 / 1024)
     }
 }
 

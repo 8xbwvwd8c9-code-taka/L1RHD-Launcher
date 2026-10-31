@@ -305,7 +305,22 @@ pub fn launch_inproc(profile: &ServerProfile, log: LogHandle) -> Result<(), Stri
             CreateRemoteThread(pi.hProcess, None, 0, lp, None, 0, None)
                 .map_err(|e| format!("CreateRemoteThread(RhdPatchStart) 失敗：{e}"))
         }?;
-        let wait = unsafe { WaitForSingleObject(th, 130000) };
+        // 心跳式等待：每 10 秒回報一次進度，凍結後重建時可把凍結窗口
+        // 收斂到 10 秒級（2026-10-31 採證筆記 §3.1-4）。逾時語意不變：130 秒。
+        let wait = {
+            let t0 = std::time::Instant::now();
+            let deadline = std::time::Duration::from_secs(130);
+            loop {
+                let w = unsafe { WaitForSingleObject(th, 10000) };
+                if w == WAIT_OBJECT_0 || t0.elapsed() >= deadline {
+                    break w;
+                }
+                log.info(format!(
+                    "等待客戶端脫殼與補丁完成… t={}s",
+                    t0.elapsed().as_secs()
+                ));
+            }
+        };
         let mut rc = 0u32;
         unsafe {
             let _ = windows::Win32::System::Threading::GetExitCodeThread(th, &mut rc);
