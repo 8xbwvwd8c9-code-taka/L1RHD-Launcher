@@ -12,7 +12,7 @@
 - src/relay.rs：本機 TCP relay。
 - src/hosts.rs：管理 hosts 中由本程式標記的區段。
 - src/launch.rs：遊戲程序檢查（`client_process_running` 等唯讀工具）。
-- src/updater.rs：更新腳本整合。
+- src/updater.rs：manifest 吃檔引擎（Login.local 同格式清單→MD5 比對→下載差異→驗證套用；http-only、防路徑穿越、單檔 512 MiB／整輪 4 GiB 上限）＋舊腳本整合（`run_script`，目前無呼叫點）。吃檔掛點在 `ui/mod.rs` 的 `boot_sequence`（`update_manifest_url` 留空＝停用；`update_strict` 控制失敗是否擋啟動）。
 - src/ui/：egui 介面與元件；boot_sequence 是 B2 入口。
 - src/inject.rs、src/remotehook.rs、src/sockhook.rs、src/patches.rs、src/loginhost.rs：**已封存**——全部以 `compile_error!` 阻止編譯，檔案僅存在以說明「外部寫碼 direct-launch 永久停用」的禁令，不得移除閘門或重新接回。
 - native/：自製 C++ DLL 與測試。`inproc.cpp`（進程內八刀補丁＋交易紀律）是補丁表的**唯一事實來源**；`inproc_contract.h`（DLL/fixture 共用契約與回傳碼）、`inproc_fixture.cpp`＋`inproc_probe.cpp`（自製宿主與同構注入鏈測試）、`bootstrap.cpp`/`probe.cpp`（載入探針）、`transaction_fixture.cpp`（補丁交易的可執行規格，12 情境）、`build.ps1`（cmake+build+ctest 20 項）。
