@@ -117,7 +117,7 @@ impl NoWindow for Command {
 
 // ── manifest 吃檔引擎（2026-10-31，依歐霸天堂官方更新架構簡化實作） ──
 //
-// 官方架構（RE 證據，見 vault 筆記 20261031 §2.5）：`Launcher/NCTinyUpdater.dll`
+// 官方架構（RE 證據，見 vault 筆記 20261031 §2.4）：`Launcher/NCTinyUpdater.dll`
 // （native，未加殼）以 protobuf 對帳（PlayncLauncherToUpdateServer /
 // UpdateServerToPlayncLauncher）、libcurl HTTP 下載、DownloadTask→DecompressTask
 // 管線套用；客戶端側完整性契約＝`Login.local`（167 條 `[data\路徑]`＋`md5=<hex>`）。
