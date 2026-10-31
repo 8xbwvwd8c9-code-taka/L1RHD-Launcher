@@ -46,6 +46,15 @@ pub struct AppConfig {
     /// 送任何封包（實測 36～168 秒上下行 0 bytes 後自行關線）。預設關閉。
     #[serde(default)]
     pub inject_s_key: bool,
+    /// 吃檔 manifest URL（Login.local 同格式：`[相對路徑]`＋`md5=<hex>`）。
+    /// 留空＝停用自動吃檔。流程同構於歐霸天堂 NCTinyUpdater（拉清單→MD5 比對→
+    /// 下載差異→驗證→就地套用），資源基準 URL 取自 manifest URL 所在目錄。
+    #[serde(default)]
+    pub update_manifest_url: String,
+    /// true＝吃檔失敗（manifest 拉取/解析失敗或有檔案下載失敗）時中止啟動；
+    /// 預設 false＝記錄後照常啟動（私服兩端同管，伺服器不在線不該擋遊戲）。
+    #[serde(default)]
+    pub update_strict: bool,
 }
 
 fn def_true() -> bool {
@@ -67,6 +76,8 @@ impl Default for AppConfig {
             login_account: String::new(),
             login_password: String::new(),
             inject_s_key: false,
+            update_manifest_url: String::new(),
+            update_strict: false,
         }
     }
 }
@@ -102,6 +113,19 @@ mod tests {
         assert!(!cfg.inject_s_key);
         let on: AppConfig = serde_json::from_str(r#"{"inject_s_key": true}"#).unwrap();
         assert!(on.inject_s_key);
+    }
+
+    #[test]
+    fn update_fields_default_to_disabled_and_lenient() {
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.update_manifest_url.is_empty());
+        assert!(!cfg.update_strict);
+        let on: AppConfig = serde_json::from_str(
+            r#"{"update_manifest_url": "http://127.0.0.1:8080/patch/manifest.local", "update_strict": true}"#,
+        )
+        .unwrap();
+        assert_eq!(on.update_manifest_url, "http://127.0.0.1:8080/patch/manifest.local");
+        assert!(on.update_strict);
     }
 }
 

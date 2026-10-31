@@ -17,6 +17,7 @@ use crate::launch;
 use crate::logging::{LogHandle, LogLine};
 use crate::relay::{self, RelayHandle};
 use crate::servers::{self, ServerProfile};
+use crate::updater;
 use eframe::egui;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -201,7 +202,40 @@ impl LauncherApp {
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let profile = p.clone();
         let log2 = self.log.clone();
+        let update_url = self.cfg.update_manifest_url.trim().to_string();
+        let update_strict = self.cfg.update_strict;
         std::thread::spawn(move || {
+            // 吃檔／自動更新（2026-10-31，流程同構於歐霸天堂 NCTinyUpdater）：
+            // update_manifest_url 留空＝停用；失敗預設不擋啟動（update_strict=false）
+            if !update_url.is_empty() {
+                match updater::run_manifest_update(
+                    std::path::Path::new(&profile.game_dir),
+                    &update_url,
+                    &log2,
+                ) {
+                    Ok(r) => {
+                        log2.info(format!(
+                            "吃檔完成：檢查 {}、未異動 {}（新增 {}／變更 {}）、下載套用 {}、失敗 {}",
+                            r.total, r.unchanged, r.missing, r.changed, r.downloaded, r.failed.len()
+                        ));
+                        if update_strict && !r.failed.is_empty() {
+                            let _ = tx.send(Err(format!(
+                                "吃檔失敗 {} 檔（update_strict=true，中止啟動）",
+                                r.failed.len()
+                            )));
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        log2.error(format!("吃檔失敗：{e}"));
+                        if update_strict {
+                            let _ = tx.send(Err(format!("吃檔失敗（update_strict=true）：{e}")));
+                            return;
+                        }
+                        log2.warn("吃檔失敗未阻擋啟動（update_strict=false）");
+                    }
+                }
+            }
             let _ = tx.send(inproc::launch_inproc(&profile, log2));
         });
         self.launch_result = Some(rx);
