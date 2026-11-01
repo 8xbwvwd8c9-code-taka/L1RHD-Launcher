@@ -25,4 +25,11 @@ cargo test --offline
 .\native\build.ps1 -BuildDir <建置產物目錄>
 ```
 
-原生載入探針、固定版本的 Detours 原始碼與測試界線見 [native/BOOTSTRAP.md](native/BOOTSTRAP.md)。歷史啟動紀錄見 [docs/B1-DIRECT-LAUNCH.md](docs/B1-DIRECT-LAUNCH.md)，不可按其舊步驟操作。
+原生載入探針、固定版本的 Detours 原始碼與測試界線見 [native/BOOTSTRAP.md](native/BOOTSTRAP.md)。
+
+## 文件與實機驗收證據
+
+- **實機驗收實證**：[docs/evidence/B4-IN-WORLD-VERIFICATION.md](docs/evidence/B4-IN-WORLD-VERIFICATION.md)（含 [進入世界截圖證據](docs/evidence/reb4_world_ok.png)、封包序列鏈與清理稽核表）。
+- **進程內八刀補丁架構**：[docs/B2-INPROC-LAUNCH.md](docs/B2-INPROC-LAUNCH.md)。
+- **黑曜石筆記庫專題文件**：[docs/vault-notes/README.md](docs/vault-notes/README.md)（收錄 26 篇登入器逆向、通訊協議與跨代研究白皮書）。
+- **歷史啟動紀錄（已封存）**：[docs/B1-DIRECT-LAUNCH.md](docs/B1-DIRECT-LAUNCH.md)，不可按其舊步驟操作。

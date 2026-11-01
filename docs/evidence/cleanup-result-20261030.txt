@@ -1,0 +1,36 @@
+OK	launcher-binary	G:\L1RHD\RHDLauncher-B2-Codex-20261030-172215.exe	15.04 MB
+OK	launcher-binary	G:\L1RHD\RHDLauncher-B2.exe	15.04 MB
+OK	launcher-binary	G:\L1RHD\RHDLauncher-B3-proxylogin.exe	15.07 MB
+OK	diagnostics-copy	G:\L1RHD\_diagnostics\B2-non15-trigger-20261030-183700\RHDLauncher-B2-Codex-20261030-172215.exe	15.04 MB
+OK	diagnostics-copy	G:\L1RHD\_diagnostics\B2-non15-trigger-v2-20261030-184800\RHDLauncher-B2-Codex-20261030-172215.exe	15.04 MB
+OK	diagnostics-copy	G:\L1RHD\_diagnostics\B2-non15-trigger-v3-loggated-20261030-191414\RHDLauncher-B2-Codex-20261030-172215.exe	15.04 MB
+OK	diagnostics-copy	G:\L1RHD\_diagnostics\B2-non15-trigger-v4-opcode1-20261030-193820\RHDLauncher-B2-Codex-20261030-172215.exe	15.04 MB
+OK	diagnostics-copy	G:\L1RHD\_diagnostics\B2-WPR-once-20261030-181832\RHDLauncher-B2-Codex-20261030-172215.exe	15.04 MB
+OK	screenshot	X:\L1RHD\.codex-work\client_after_login.png	1.65 MB
+OK	screenshot	X:\L1RHD\.codex-work\client_front.png	1.81 MB
+OK	screenshot	X:\L1RHD\.codex-work\client_full.png	1.81 MB
+OK	screenshot	X:\L1RHD\.codex-work\client_now.png	1.81 MB
+OK	screenshot	X:\L1RHD\.codex-work\client_v3.png	1.85 MB
+OK	screenshot	X:\L1RHD\.codex-work\client_v4.png	1.78 MB
+OK	screenshot	X:\L1RHD\.codex-work\client_window.png	1.44 MB
+OK	launcher-binary	I:\RHD\RHDLauncher-rs\RHDLauncher-B1.exe	15.09 MB
+OK	launcher-binary	I:\RHD\RHDLauncher-rs\RHDLauncher-B1.pdb	103.45 MB
+OK	launcher-binary	I:\RHD\RHDLauncher-rs\RHDLauncher.exe	8.49 MB
+OK	launcher-binary	I:\RHD\RHDLauncher-rs\rhd_inproc.dll	0.17 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\shot1.png	6.54 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\shot2.png	2.09 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\shot3.png	0.04 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui.png	0.06 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui10.png	1.16 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui11.png	0.93 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui12.png	0.93 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui2.png	0.07 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui3.png	0.87 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui4.png	0.61 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui5.png	0.52 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui6.png	0.83 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui7.png	0.68 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui8.png	0.69 MB
+OK	ui-screenshot	I:\RHD\RHDLauncher-rs\ui9.png	0.94 MB
+OK	target-tree	I:\RHD\RHDLauncher-rs\target	10243 files / 8270.9 MB
+FREED_MB=	8547.6
